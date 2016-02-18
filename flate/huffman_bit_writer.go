@@ -286,11 +286,10 @@ func (w *huffmanBitWriter) writeCode(code *huffmanEncoder, literal uint32) {
 }
 */
 
-func (w *huffmanBitWriter) writeCode(code *huffmanEncoder, literal uint32) {
+func (w *huffmanBitWriter) writeCode(c hcode) {
 	if w.err != nil {
 		return
 	}
-	c := code.codes[literal]
 	w.bits |= uint64(c.code()) << w.nbits
 	w.nbits += c.bits()
 	if w.nbits >= 48 {
@@ -346,7 +345,7 @@ func (w *huffmanBitWriter) writeDynamicHeader(numLiterals int, numOffsets int, n
 			break
 		}
 		// The low byte contains the actual code to generate.
-		w.writeCode(w.codegenEncoding, uint32(codeWord))
+		w.writeCode(w.codegenEncoding.codes[codeWord])
 
 		switch codeWord {
 		case 16:
@@ -403,10 +402,9 @@ func (w *huffmanBitWriter) writeBlock(tok tokens, eof bool, input []byte) {
 	tokens := tok.tokens[0 : tok.n+1]
 
 	for _, t := range tokens {
-		switch t.typ() {
-		case literalType:
+		if t < matchType {
 			w.literalFreq[t.literal()]++
-		case matchType:
+		} else {
 			length := t.length()
 			offset := t.offset()
 			w.literalFreq[lengthCodesStart+lengthCode(length)]++
@@ -462,8 +460,10 @@ func (w *huffmanBitWriter) writeBlock(tok tokens, eof bool, input []byte) {
 		fixedLiteralEncoding.bitLength(w.literalFreq) +
 		fixedOffsetEncoding.bitLength(w.offsetFreq) +
 		extraBits
-	var literalEncoding = fixedLiteralEncoding
-	var offsetEncoding = fixedOffsetEncoding
+
+	var usingFixed = true
+	var literalEncoding = fixedLiteralEncoding.codes
+	var offsetEncoding = fixedOffsetEncoding.codes
 
 	// Dynamic Huffman?
 	var numCodegens int
@@ -488,8 +488,9 @@ func (w *huffmanBitWriter) writeBlock(tok tokens, eof bool, input []byte) {
 
 	if dynamicSize < size {
 		size = dynamicSize
-		literalEncoding = w.literalEncoding
-		offsetEncoding = w.dynamicEncoding
+		literalEncoding = w.literalEncoding.codes
+		offsetEncoding = w.dynamicEncoding.codes
+		usingFixed = false
 	}
 
 	// Stored bytes?
@@ -500,21 +501,19 @@ func (w *huffmanBitWriter) writeBlock(tok tokens, eof bool, input []byte) {
 	}
 
 	// Huffman.
-	if literalEncoding == fixedLiteralEncoding {
+	if usingFixed {
 		w.writeFixedHeader(eof)
 	} else {
 		w.writeDynamicHeader(numLiterals, numOffsets, numCodegens, eof)
 	}
 	for _, t := range tokens {
-		switch t.typ() {
-		case literalType:
-			w.writeCode(literalEncoding, t.literal())
-			break
-		case matchType:
+		if t < matchType {
+			w.writeCode(literalEncoding[t.literal()])
+		} else {
 			// Write the length
 			length := t.length()
 			lengthCode := lengthCode(length)
-			w.writeCode(literalEncoding, lengthCode+lengthCodesStart)
+			w.writeCode(literalEncoding[lengthCode+lengthCodesStart])
 			extraLengthBits := uint(lengthExtraBits[lengthCode])
 			if extraLengthBits > 0 {
 				extraLength := int32(length - lengthBase[lengthCode])
@@ -523,15 +522,12 @@ func (w *huffmanBitWriter) writeBlock(tok tokens, eof bool, input []byte) {
 			// Write the offset
 			offset := t.offset()
 			offsetCode := offsetCode(offset)
-			w.writeCode(offsetEncoding, offsetCode)
+			w.writeCode(offsetEncoding[offsetCode])
 			extraOffsetBits := uint(offsetExtraBits[offsetCode])
 			if extraOffsetBits > 0 {
 				extraOffset := int32(offset - offsetBase[offsetCode])
 				w.writeBits(extraOffset, extraOffsetBits)
 			}
-			break
-		default:
-			panic("unknown token type: " + string(t))
 		}
 	}
 }
@@ -550,10 +546,9 @@ func (w *huffmanBitWriter) writeBlockDynamic(tok tokens, eof bool, input []byte)
 	tokens := tok.tokens[0 : tok.n+1]
 
 	for _, t := range tokens {
-		switch t.typ() {
-		case literalType:
+		if t < matchType {
 			w.literalFreq[t.literal()]++
-		case matchType:
+		} else {
 			length := t.length()
 			offset := t.offset()
 			w.literalFreq[lengthCodesStart+lengthCode(length)]++
@@ -591,21 +586,19 @@ func (w *huffmanBitWriter) writeBlockDynamic(tok tokens, eof bool, input []byte)
 	for numCodegens > 4 && w.codegenFreq[codegenOrder[numCodegens-1]] == 0 {
 		numCodegens--
 	}
-	var literalEncoding = w.literalEncoding
-	var offsetEncoding = w.dynamicEncoding
+	var literalEncoding = w.literalEncoding.codes
+	var offsetEncoding = w.dynamicEncoding.codes
 
 	// Write Huffman table.
 	w.writeDynamicHeader(numLiterals, numOffsets, numCodegens, eof)
 	for _, t := range tokens {
-		switch t.typ() {
-		case literalType:
-			w.writeCode(literalEncoding, t.literal())
-			break
-		case matchType:
+		if t < matchType {
+			w.writeCode(literalEncoding[t.literal()])
+		} else {
 			// Write the length
 			length := t.length()
 			lengthCode := lengthCode(length)
-			w.writeCode(literalEncoding, lengthCode+lengthCodesStart)
+			w.writeCode(literalEncoding[lengthCode+lengthCodesStart])
 			extraLengthBits := uint(lengthExtraBits[lengthCode])
 			if extraLengthBits > 0 {
 				extraLength := int32(length - lengthBase[lengthCode])
@@ -614,15 +607,12 @@ func (w *huffmanBitWriter) writeBlockDynamic(tok tokens, eof bool, input []byte)
 			// Write the offset
 			offset := t.offset()
 			offsetCode := offsetCode(offset)
-			w.writeCode(offsetEncoding, offsetCode)
+			w.writeCode(offsetEncoding[offsetCode])
 			extraOffsetBits := uint(offsetExtraBits[offsetCode])
 			if extraOffsetBits > 0 {
 				extraOffset := int32(offset - offsetBase[offsetCode])
 				w.writeBits(extraOffset, extraOffsetBits)
 			}
-			break
-		default:
-			panic("unknown token type: " + string(t))
 		}
 	}
 }
@@ -706,9 +696,10 @@ func (w *huffmanBitWriter) writeBlockHuff(eof bool, input []byte) {
 
 	// Huffman.
 	w.writeDynamicHeader(numLiterals, numOffsets, numCodegens, eof)
+	encoding := w.literalEncoding.codes
 	for _, t := range input {
 		// Bitwriting inlined, ~30% speedup
-		c := w.literalEncoding.codes[t]
+		c := encoding[t]
 		w.bits |= uint64(c.code()) << w.nbits
 		w.nbits += c.bits()
 		if w.nbits >= 48 {
@@ -734,6 +725,5 @@ func (w *huffmanBitWriter) writeBlockHuff(eof bool, input []byte) {
 			}
 		}
 	}
-	// Write EOB
-	w.writeCode(w.literalEncoding, endBlockMarker)
+	w.writeCode(w.literalEncoding.codes[endBlockMarker])
 }

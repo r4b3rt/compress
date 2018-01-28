@@ -53,6 +53,20 @@ func (b *bitReader) getBitsFast(n uint8) uint16 {
 	return v
 }
 
+// get2Bits ...
+func (b *bitReader) get2Bits(n, n2 uint8) (uint16, uint16) {
+	b.fillFast()
+	const regMask = 64 - 1
+	d := 64 - b.bitsRead - n
+	d2 := d - n2
+	m1 := bitMask16[n&31]
+	m2 := bitMask16[n2&31]
+	v := uint16(b.value>>(d&regMask)) & m1
+	v2 := uint16(b.value>>(d2&regMask)) & m2
+	b.bitsRead += n + n2
+	return v, v2
+}
+
 // fillFast() will make sure at least 32 bits are available.
 // There must be at least 4 bytes available.
 func (b *bitReader) fillFast() {

@@ -207,91 +207,76 @@ func (s *Scratch) buildDtable() error {
 }
 
 func (s *Scratch) decompress() error {
-	br := &s.bits
-	br.init(s.br.unread())
-
-	var s1, s2 decoder
-	s1.init(br, s.decTable, s.actualTableLog)
-	s2.init(br, s.decTable, s.actualTableLog)
+	var dec decoder
+	dec.init(s.br.unread(), s.decTable, s.actualTableLog)
 
 	// Use temp table to avoid bound checks/append penalty.
 	var tmp = s.ct.tableSymbol[:256]
 	var off uint8
 
 	// Main part
-	if s.decFast {
-		for br.off >= 8 {
-			br.fillFast()
-			tmp[off+0] = s1.nextFast()
-			tmp[off+1] = s2.nextFast()
-			br.fillFast()
-			tmp[off+2] = s1.nextFast()
-			tmp[off+3] = s2.nextFast()
-			off += 4
-			if off == 0 {
-				s.Out = append(s.Out, tmp...)
-			}
-		}
-	} else {
-		for br.off >= 8 {
-			br.fillFast()
-			tmp[off+0] = s1.next()
-			tmp[off+1] = s2.next()
-			br.fillFast()
-			tmp[off+2] = s1.next()
-			tmp[off+3] = s2.next()
-			off += 4
-			if off == 0 {
-				s.Out = append(s.Out, tmp...)
-				off = 0
-			}
+	for dec.off >= 8 {
+		tmp[off+0], tmp[off+1] = dec.decTwo()
+		tmp[off+2], tmp[off+3] = dec.decTwo()
+		off += 4
+		if off == 0 {
+			s.Out = append(s.Out, tmp...)
+			off = 0
 		}
 	}
 	s.Out = append(s.Out, tmp[:off]...)
 
 	// Final bits, a bit more expensive check
 	for {
-		br.fill()
-		s.Out = append(s.Out, s1.next())
-		if br.finished() {
-			s.Out = append(s.Out, s2.next(), s1.next())
+		dec.fill()
+		s.Out = append(s.Out, dec.dec1())
+		if dec.finished() {
+			s.Out = append(s.Out, dec.dec2(), dec.dec1())
 			break
 		}
-		if !br.finished() {
-			s.Out = append(s.Out, s2.next())
-			if br.finished() {
-				s.Out = append(s.Out, s1.next(), s2.next())
+		if !dec.finished() {
+			s.Out = append(s.Out, dec.dec2())
+			if dec.finished() {
+				s.Out = append(s.Out, dec.dec1(), dec.dec2())
 				break
 			}
 		}
 	}
-	br.in = nil
 	return nil
 }
 
 type decoder struct {
-	state uint16
-	br    *bitReader
-	dt    []decSymbol
+	bitReader
+	state, state2 uint16
+	dt            []decSymbol
 }
 
-func (d *decoder) init(in *bitReader, dt []decSymbol, tableLog uint8) {
+func (d *decoder) init(in []byte, dt []decSymbol, tableLog uint8) {
 	d.dt = dt
-	d.br = in
-	d.state = uint16(in.getBits(tableLog))
+	d.bitReader.init(in)
+	d.state, d.state2 = d.get2Bits(tableLog, tableLog)
 }
 
-func (d *decoder) next() uint8 {
+func (d *decoder) decTwo() (uint8, uint8) {
 	n := &d.dt[d.state]
-	lowBits := d.br.getBits(n.nbBits)
+	n2 := &d.dt[d.state2]
+	b1, b2 := d.get2Bits(n.nbBits, n2.nbBits)
+	d.state = n.newState + b1
+	d.state2 = n2.newState + b2
+	return n.symbol, n2.symbol
+}
+
+func (d *decoder) dec1() uint8 {
+	n := &d.dt[d.state]
+	lowBits := d.getBits(n.nbBits)
 	d.state = n.newState + lowBits
 	return n.symbol
 }
 
-func (d *decoder) nextFast() uint8 {
-	n := &d.dt[d.state]
-	lowBits := d.br.getBitsFast(n.nbBits)
-	d.state = n.newState + lowBits
+func (d *decoder) dec2() uint8 {
+	n := &d.dt[d.state2]
+	lowBits := d.getBits(n.nbBits)
+	d.state2 = n.newState + lowBits
 	return n.symbol
 }
 

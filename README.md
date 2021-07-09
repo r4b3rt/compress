@@ -6,6 +6,7 @@ This package provides various compression algorithms.
 * [S2](https://github.com/klauspost/compress/tree/master/s2#s2-compression) is a high performance replacement for Snappy.
 * Optimized [deflate](https://godoc.org/github.com/klauspost/compress/flate) packages which can be used as a dropin replacement for [gzip](https://godoc.org/github.com/klauspost/compress/gzip), [zip](https://godoc.org/github.com/klauspost/compress/zip) and [zlib](https://godoc.org/github.com/klauspost/compress/zlib).
 * [huff0](https://github.com/klauspost/compress/tree/master/huff0) and [FSE](https://github.com/klauspost/compress/tree/master/fse) implementations for raw entropy encoding.
+* [gzhttp](https://github.com/klauspost/compress/tree/master/gzhttp) Provides client and server wrappers for handling gzipped requests efficiently.
 * [pgzip](https://github.com/klauspost/pgzip) is a separate package that provides a very fast parallel gzip implementation.
 * [fuzz package](https://github.com/klauspost/compress-fuzz) for fuzz testing all compressors/decompressors here.
 
@@ -14,6 +15,31 @@ This package provides various compression algorithms.
 [![Sourcegraph Badge](https://sourcegraph.com/github.com/klauspost/compress/-/badge.svg)](https://sourcegraph.com/github.com/klauspost/compress?badge)
 
 # changelog
+
+* Jun 14, 2021 (v1.13.1)
+
+	* s2: Add full Snappy output support  [#396](https://github.com/klauspost/compress/pull/396)
+	* zstd: Add configurable [Decoder window](https://pkg.go.dev/github.com/klauspost/compress/zstd#WithDecoderMaxWindow) size [#394](https://github.com/klauspost/compress/pull/394)
+	* gzhttp: Add header to skip compression  [#389](https://github.com/klauspost/compress/pull/389)
+	* s2: Improve speed with bigger output margin  [#395](https://github.com/klauspost/compress/pull/395)
+
+* Jun 3, 2021 (v1.13.0)
+	* Added [gzhttp](https://github.com/klauspost/compress/tree/master/gzhttp#gzip-handler) which allows wrapping HTTP servers and clients with GZIP compressors.
+	* zstd: Detect short invalid signatures [#382](https://github.com/klauspost/compress/pull/382)
+	* zstd: Spawn decoder goroutine only if needed. [#380](https://github.com/klauspost/compress/pull/380)
+
+* May 25, 2021 (v1.12.3)
+	* deflate: Better/faster Huffman encoding [#374](https://github.com/klauspost/compress/pull/374)
+	* deflate: Allocate less for history. [#375](https://github.com/klauspost/compress/pull/375)
+	* zstd: Forward read errors [#373](https://github.com/klauspost/compress/pull/373) 
+
+* Apr 27, 2021 (v1.12.2)
+	* zstd: Improve better/best compression [#360](https://github.com/klauspost/compress/pull/360) [#364](https://github.com/klauspost/compress/pull/364) [#365](https://github.com/klauspost/compress/pull/365)
+	* zstd: Add helpers to compress/decompress zstd inside zip files [#363](https://github.com/klauspost/compress/pull/363)
+	* deflate: Improve level 5+6 compression [#367](https://github.com/klauspost/compress/pull/367)
+	* s2: Improve better/best compression [#358](https://github.com/klauspost/compress/pull/358) [#359](https://github.com/klauspost/compress/pull/358)
+	* s2: Load after checking src limit on amd64. [#362](https://github.com/klauspost/compress/pull/362)
+	* s2sx: Limit max executable size [#368](https://github.com/klauspost/compress/pull/368) 
 
 * Apr 14, 2021 (v1.12.1)
 	* snappy package removed. Upstream added as dependency.
@@ -264,6 +290,10 @@ The packages contains the same as the standard library, so you can use the godoc
 
 Currently there is only minor speedup on decompression (mostly CRC32 calculation).
 
+Memory usage is typically 1MB for a Writer. stdlib is in the same range. 
+If you expect to have a lot of concurrently allocated Writers consider using 
+the stateless compress described below.
+
 # Stateless compression
 
 This package offers stateless compression as a special option for gzip/deflate. 
@@ -364,7 +394,7 @@ The most notable thing is how quickly the standard library drops to very low com
 This is mainly a test of how good the algorithms are at detecting un-compressible input. The standard library only offers this feature with very conservative settings at level 1. Obviously there is no reason for the algorithms to try to compress input that cannot be compressed.  The only downside is that it might skip some compressible data on false detections.
 
 
-# linear time compression (huffman only)
+## Huffman only compression
 
 This compression library adds a special compression level, named `HuffmanOnly`, which allows near linear time compression. This is done by completely disabling matching of previous data, and only reduce the number of bits to represent each character. 
 

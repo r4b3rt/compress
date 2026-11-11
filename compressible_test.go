@@ -3,18 +3,12 @@ package compress
 import (
 	"crypto/rand"
 	"encoding/base32"
-	"io/ioutil"
-	"strconv"
-	"strings"
 	"testing"
-
-	"github.com/klauspost/compress/flate"
-	"github.com/klauspost/compress/gzip"
 )
 
 func BenchmarkEstimate(b *testing.B) {
 	b.ReportAllocs()
-	// (predictable, low entropy distibution)
+	// (predictable, low entropy distribution)
 	b.Run("zeroes-5k", func(b *testing.B) {
 		var testData = make([]byte, 5000)
 		b.SetBytes(int64(len(testData)))
@@ -25,7 +19,7 @@ func BenchmarkEstimate(b *testing.B) {
 		b.Log(Estimate(testData))
 	})
 
-	// (predictable, high entropy distibution)
+	// (predictable, high entropy distribution)
 	b.Run("predictable-5k", func(b *testing.B) {
 		var testData = make([]byte, 5000)
 		for i := range testData {
@@ -39,7 +33,7 @@ func BenchmarkEstimate(b *testing.B) {
 		b.Log(Estimate(testData))
 	})
 
-	// (not predictable, high entropy distibution)
+	// (not predictable, high entropy distribution)
 	b.Run("random-500b", func(b *testing.B) {
 		var testData = make([]byte, 500)
 		rand.Read(testData)
@@ -51,7 +45,7 @@ func BenchmarkEstimate(b *testing.B) {
 		b.Log(Estimate(testData))
 	})
 
-	// (not predictable, high entropy distibution)
+	// (not predictable, high entropy distribution)
 	b.Run("random-5k", func(b *testing.B) {
 		var testData = make([]byte, 5000)
 		rand.Read(testData)
@@ -63,7 +57,7 @@ func BenchmarkEstimate(b *testing.B) {
 		b.Log(Estimate(testData))
 	})
 
-	// (not predictable, high entropy distibution)
+	// (not predictable, high entropy distribution)
 	b.Run("random-50k", func(b *testing.B) {
 		var testData = make([]byte, 50000)
 		rand.Read(testData)
@@ -75,7 +69,7 @@ func BenchmarkEstimate(b *testing.B) {
 		b.Log(Estimate(testData))
 	})
 
-	// (not predictable, high entropy distibution)
+	// (not predictable, high entropy distribution)
 	b.Run("random-500k", func(b *testing.B) {
 		var testData = make([]byte, 500000)
 		rand.Read(testData)
@@ -87,7 +81,7 @@ func BenchmarkEstimate(b *testing.B) {
 		b.Log(Estimate(testData))
 	})
 
-	// (not predictable, medium entropy distibution)
+	// (not predictable, medium entropy distribution)
 	b.Run("base-32-5k", func(b *testing.B) {
 		var testData = make([]byte, 5000)
 		rand.Read(testData)
@@ -101,7 +95,7 @@ func BenchmarkEstimate(b *testing.B) {
 		}
 		b.Log(Estimate(testData))
 	})
-	// (medium predictable, medium entropy distibution)
+	// (medium predictable, medium entropy distribution)
 	b.Run("text", func(b *testing.B) {
 		var testData = []byte(`If compression is done per-chunk, care should be taken that it doesn't leave restic backups open to watermarking/fingerprinting attacks.
 This is essentially the same problem we discussed related to fingerprinting the CDC deduplication process:
@@ -128,7 +122,7 @@ Thoughts?`)
 
 func BenchmarkSnannonEntropyBits(b *testing.B) {
 	b.ReportAllocs()
-	// (predictable, low entropy distibution)
+	// (predictable, low entropy distribution)
 	b.Run("zeroes-5k", func(b *testing.B) {
 		var testData = make([]byte, 5000)
 		b.SetBytes(int64(len(testData)))
@@ -139,7 +133,7 @@ func BenchmarkSnannonEntropyBits(b *testing.B) {
 		b.Log(ShannonEntropyBits(testData))
 	})
 
-	// (predictable, high entropy distibution)
+	// (predictable, high entropy distribution)
 	b.Run("predictable-5k", func(b *testing.B) {
 		var testData = make([]byte, 5000)
 		for i := range testData {
@@ -153,7 +147,7 @@ func BenchmarkSnannonEntropyBits(b *testing.B) {
 		b.Log(ShannonEntropyBits(testData))
 	})
 
-	// (not predictable, high entropy distibution)
+	// (not predictable, high entropy distribution)
 	b.Run("random-500b", func(b *testing.B) {
 		var testData = make([]byte, 500)
 		rand.Read(testData)
@@ -165,7 +159,7 @@ func BenchmarkSnannonEntropyBits(b *testing.B) {
 		b.Log(ShannonEntropyBits(testData))
 	})
 
-	// (not predictable, high entropy distibution)
+	// (not predictable, high entropy distribution)
 	b.Run("random-5k", func(b *testing.B) {
 		var testData = make([]byte, 5000)
 		rand.Read(testData)
@@ -177,7 +171,7 @@ func BenchmarkSnannonEntropyBits(b *testing.B) {
 		b.Log(ShannonEntropyBits(testData))
 	})
 
-	// (not predictable, high entropy distibution)
+	// (not predictable, high entropy distribution)
 	b.Run("random-50k", func(b *testing.B) {
 		var testData = make([]byte, 50000)
 		rand.Read(testData)
@@ -189,7 +183,7 @@ func BenchmarkSnannonEntropyBits(b *testing.B) {
 		b.Log(ShannonEntropyBits(testData))
 	})
 
-	// (not predictable, high entropy distibution)
+	// (not predictable, high entropy distribution)
 	b.Run("random-500k", func(b *testing.B) {
 		var testData = make([]byte, 500000)
 		rand.Read(testData)
@@ -201,7 +195,7 @@ func BenchmarkSnannonEntropyBits(b *testing.B) {
 		b.Log(ShannonEntropyBits(testData))
 	})
 
-	// (not predictable, medium entropy distibution)
+	// (not predictable, medium entropy distribution)
 	b.Run("base-32-5k", func(b *testing.B) {
 		var testData = make([]byte, 5000)
 		rand.Read(testData)
@@ -215,7 +209,7 @@ func BenchmarkSnannonEntropyBits(b *testing.B) {
 		}
 		b.Log(ShannonEntropyBits(testData))
 	})
-	// (medium predictable, medium entropy distibution)
+	// (medium predictable, medium entropy distribution)
 	b.Run("text", func(b *testing.B) {
 		var testData = []byte(`If compression is done per-chunk, care should be taken that it doesn't leave restic backups open to watermarking/fingerprinting attacks.
 This is essentially the same problem we discussed related to fingerprinting the CDC deduplication process:
@@ -237,66 +231,5 @@ Thoughts?`)
 			ShannonEntropyBits(testData)
 		}
 		b.Log(ShannonEntropyBits(testData))
-	})
-}
-
-func BenchmarkCompressAllocations(b *testing.B) {
-	payload := []byte(strings.Repeat("Tiny payload", 20))
-	for j := -2; j <= 9; j++ {
-		b.Run("level("+strconv.Itoa(j)+")", func(b *testing.B) {
-			b.Run("flate", func(b *testing.B) {
-				b.ReportAllocs()
-
-				for i := 0; i < b.N; i++ {
-					w, err := flate.NewWriter(ioutil.Discard, j)
-					if err != nil {
-						b.Fatal(err)
-					}
-					w.Write(payload)
-					w.Close()
-				}
-			})
-			b.Run("gzip", func(b *testing.B) {
-				b.ReportAllocs()
-
-				for i := 0; i < b.N; i++ {
-					w, err := gzip.NewWriterLevel(ioutil.Discard, j)
-					if err != nil {
-						b.Fatal(err)
-					}
-					w.Write(payload)
-					w.Close()
-				}
-			})
-		})
-	}
-}
-
-func BenchmarkCompressAllocationsSingle(b *testing.B) {
-	payload := []byte(strings.Repeat("Tiny payload", 20))
-	const level = 2
-	b.Run("flate", func(b *testing.B) {
-		b.ReportAllocs()
-
-		for i := 0; i < b.N; i++ {
-			w, err := flate.NewWriter(ioutil.Discard, level)
-			if err != nil {
-				b.Fatal(err)
-			}
-			w.Write(payload)
-			w.Close()
-		}
-	})
-	b.Run("gzip", func(b *testing.B) {
-		b.ReportAllocs()
-
-		for i := 0; i < b.N; i++ {
-			w, err := gzip.NewWriterLevel(ioutil.Discard, level)
-			if err != nil {
-				b.Fatal(err)
-			}
-			w.Write(payload)
-			w.Close()
-		}
 	})
 }

@@ -5,11 +5,12 @@
 package gzip
 
 import (
+	"bufio"
 	"bytes"
 	oldgz "compress/gzip"
 	"crypto/rand"
+	"errors"
 	"io"
-	"io/ioutil"
 	"os"
 	"strings"
 	"testing"
@@ -408,18 +409,21 @@ func TestDecompressor(t *testing.T) {
 }
 
 func TestIssue6550(t *testing.T) {
-	f, err := os.Open("testdata/issue6550.gz")
+	b, err := os.ReadFile("testdata/issue6550.gz")
 	if err != nil {
 		t.Fatal(err)
 	}
-	gzip, err := NewReader(f)
+	// issue6550.gz has invalid flag bit set.
+	// TestReservedBits tests that. Fix it up for this test.
+	b[3] &= 0x1f
+	gzip, err := NewReader(bytes.NewReader(b))
 	if err != nil {
 		t.Fatalf("NewReader(testdata/issue6550.gz): %v", err)
 	}
 	defer gzip.Close()
 	done := make(chan bool, 1)
 	go func() {
-		_, err := io.Copy(ioutil.Discard, gzip)
+		_, err := io.Copy(io.Discard, gzip)
 		if err == nil {
 			t.Errorf("Copy succeeded")
 		} else {
@@ -432,6 +436,21 @@ func TestIssue6550(t *testing.T) {
 		t.Errorf("Copy hung")
 	case <-done:
 		// ok
+	}
+}
+
+func TestReservedBits(t *testing.T) {
+	f, err := os.Open("testdata/issue6550.gz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	_, err = NewReader(f)
+	if err == nil {
+		t.Fatalf("Reserved bits did not result in error")
+	}
+	if !errors.Is(err, ErrHeader) {
+		t.Fatal("Expected ErrHeader, got", err)
 	}
 }
 
@@ -470,7 +489,7 @@ Found:
 	const hello = "hello world\n"
 
 	r.Multistream(false)
-	data, err := ioutil.ReadAll(&r)
+	data, err := io.ReadAll(&r)
 	if string(data) != hello || err != nil {
 		t.Fatalf("first stream = %q, %v, want %q, %v", string(data), err, hello, nil)
 	}
@@ -479,7 +498,7 @@ Found:
 		t.Fatalf("second reset: %v", err)
 	}
 	r.Multistream(false)
-	data, err = ioutil.ReadAll(&r)
+	data, err = io.ReadAll(&r)
 	if string(data) != hello || err != nil {
 		t.Fatalf("second stream = %q, %v, want %q, %v", string(data), err, hello, nil)
 	}
@@ -500,7 +519,7 @@ func TestWriteTo(t *testing.T) {
 	}
 	compressed := &bytes.Buffer{}
 	// Do it twice to test MultiStream functionality
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		w, err := NewWriterLevel(compressed, -2)
 		if err != nil {
 			t.Fatal(err)
@@ -522,7 +541,7 @@ func TestWriteTo(t *testing.T) {
 		t.Fatal(err)
 	}
 	// ReadAll does not use WriteTo, but we wrap it in a NopCloser to be sure.
-	readall, err := ioutil.ReadAll(ioutil.NopCloser(dec))
+	readall, err := io.ReadAll(io.NopCloser(dec))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -538,6 +557,7 @@ func TestWriteTo(t *testing.T) {
 		t.Fatal(err)
 	}
 	wtbuf := &bytes.Buffer{}
+
 	written, err := dec.WriteTo(wtbuf)
 	if err != nil {
 		t.Fatal(err)
@@ -563,26 +583,47 @@ func TestNilStream(t *testing.T) {
 }
 
 func TestTruncatedStreams(t *testing.T) {
-	const data = "\x1f\x8b\b\x04\x00\tn\x88\x00\xff\a\x00foo bar\xcbH\xcd\xc9\xc9\xd7Q(\xcf/\xcaI\x01\x04:r\xab\xff\f\x00\x00\x00"
+	const original = "\x1f\x8b\b\x04\x00\tn\x88\x00\xff\a\x00foo bar\xcbH\xcd\xc9\xc9\xd7Q(\xcf/\xcaI\x01\x04:r\xab\xff\f\x00\x00\x00"
+
+	cases := []struct {
+		name   string
+		prefix string // complete members before the truncated one
+		data   string
+	}{
+		{name: "original", data: original},
+		{name: "truncated name", data: "\x1f\x8b\x08\x08\x00\x00\x00\x00\x00\xff\x01"},
+		{name: "truncated comment", data: "\x1f\x8b\x08\x10\x00\x00\x00\x00\x00\xff\x01"},
+		{name: "second member truncated name", prefix: original, data: "\x1f\x8b\x08\x08\x00\x00\x00\x00\x00\xff\x01"},
+	}
 
 	// Intentionally iterate starting with at least one byte in the stream.
-	for i := 1; i < len(data)-1; i++ {
-		r, err := NewReader(strings.NewReader(data[:i]))
-		if err != nil {
-			if err != io.ErrUnexpectedEOF {
-				t.Errorf("NewReader(%d) on truncated stream: got %v, want %v", i, err, io.ErrUnexpectedEOF)
+	for _, tc := range cases {
+		for i := 1; i < len(tc.data); i++ {
+			r, err := NewReader(strings.NewReader(tc.prefix + tc.data[:i]))
+			if err != nil {
+				if err != io.ErrUnexpectedEOF {
+					t.Errorf("NewReader(%s-%d) on truncated stream: got %v, want %v", tc.name, i, err, io.ErrUnexpectedEOF)
+				}
+				continue
 			}
-			continue
-		}
-		_, err = io.Copy(ioutil.Discard, r)
-		if err != io.ErrUnexpectedEOF {
-			t.Errorf("io.Copy(%d) on truncated stream: got %v, want %v", i, err, io.ErrUnexpectedEOF)
+			// io.Copy uses Reader.WriteTo.
+			_, err = io.Copy(io.Discard, r)
+			if err != io.ErrUnexpectedEOF {
+				t.Errorf("io.Copy(%s-%d) on truncated stream: got %v, want %v", tc.name, i, err, io.ErrUnexpectedEOF)
+			}
+			if err := r.Reset(strings.NewReader(tc.prefix + tc.data[:i])); err != nil {
+				t.Fatalf("Reset(%s-%d): %v", tc.name, i, err)
+			}
+			_, err = io.ReadAll(struct{ io.Reader }{r})
+			if err != io.ErrUnexpectedEOF {
+				t.Errorf("Read(%s-%d) on truncated stream: got %v, want %v", tc.name, i, err, io.ErrUnexpectedEOF)
+			}
 		}
 	}
 }
 
 func BenchmarkGunzipCopy(b *testing.B) {
-	dat, _ := ioutil.ReadFile("testdata/test.json")
+	dat, _ := os.ReadFile("testdata/test.json")
 	dat = append(dat, dat...)
 	dat = append(dat, dat...)
 	dat = append(dat, dat...)
@@ -603,7 +644,7 @@ func BenchmarkGunzipCopy(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		_, err = io.Copy(ioutil.Discard, r)
+		_, err = io.Copy(io.Discard, r)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -611,7 +652,7 @@ func BenchmarkGunzipCopy(b *testing.B) {
 }
 
 func BenchmarkGunzipNoWriteTo(b *testing.B) {
-	dat, _ := ioutil.ReadFile("testdata/test.json")
+	dat, _ := os.ReadFile("testdata/test.json")
 	dat = append(dat, dat...)
 	dat = append(dat, dat...)
 	dat = append(dat, dat...)
@@ -636,7 +677,7 @@ func BenchmarkGunzipNoWriteTo(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		_, err = io.Copy(ioutil.Discard, ioutil.NopCloser(r))
+		_, err = io.Copy(io.Discard, io.NopCloser(r))
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -644,7 +685,7 @@ func BenchmarkGunzipNoWriteTo(b *testing.B) {
 }
 
 func BenchmarkGunzipStdlib(b *testing.B) {
-	dat, _ := ioutil.ReadFile("testdata/test.json")
+	dat, _ := os.ReadFile("testdata/test.json")
 	dat = append(dat, dat...)
 	dat = append(dat, dat...)
 	dat = append(dat, dat...)
@@ -669,7 +710,7 @@ func BenchmarkGunzipStdlib(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		_, err = io.Copy(ioutil.Discard, r)
+		_, err = io.Copy(io.Discard, r)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -692,7 +733,7 @@ func TestTruncatedGunzip(t *testing.T) {
 		go func() {
 			r, err := NewReader(bytes.NewBuffer(testdata[:i]))
 			if err == nil {
-				b, err := ioutil.ReadAll(r)
+				b, err := io.ReadAll(r)
 				if err == nil && !bytes.Equal(testdata[:i], b) {
 					close(fail)
 				}
@@ -707,5 +748,126 @@ func TestTruncatedGunzip(t *testing.T) {
 		case <-done:
 			timer.Stop()
 		}
+	}
+}
+
+func TestBufferedPartialCopyGzip(t *testing.T) {
+	var (
+		in           = []byte("hello\nworld")
+		compressedIn []byte
+	)
+
+	var buf bytes.Buffer
+	gzw := NewWriter(&buf)
+	if _, err := gzw.Write(in); err != nil {
+		panic(err)
+	}
+	if err := gzw.Flush(); err != nil {
+		panic(err)
+	}
+	if err := gzw.Close(); err != nil {
+		panic(err)
+	}
+
+	compressedIn = buf.Bytes()
+
+	gz, err := NewReader(bytes.NewReader(compressedIn))
+	if err != nil {
+		t.Errorf("constructing a reader: %v", err)
+	}
+
+	br := bufio.NewReader(gz)
+	if _, err := br.ReadBytes('\n'); err != nil {
+		t.Errorf("reading to the first newline: %v", err)
+	}
+
+	var out bytes.Buffer
+	_, err = io.Copy(&out, br)
+	if !bytes.Equal(out.Bytes(), []byte("world")) {
+		t.Errorf("unexpected output when reading the remainder")
+	}
+	if err != nil {
+		t.Errorf("reading the remainder: %v", err)
+	}
+}
+
+func TestWriteToThenReadSingleStream(t *testing.T) {
+	var buf bytes.Buffer
+	w := NewWriter(&buf)
+	w.Write([]byte("first"))
+	w.Close()
+	w.Reset(&buf)
+	w.Write([]byte("second"))
+	w.Close()
+
+	z, err := NewReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	z.Multistream(false)
+	// WriteTo consumes the single member, just like Read would.
+	if _, err := z.WriteTo(io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	// A later Read must report io.EOF. Without state carried over from
+	// WriteTo, Read tries to interpret the next member's header bytes as
+	// a checksum and reports ErrChecksum instead.
+	var p [8]byte
+	if _, err := z.Read(p[:]); err != io.EOF {
+		t.Fatalf("got %v, want io.EOF", err)
+	}
+}
+
+// eofWriter accepts up to n bytes and reports io.EOF. A destination that
+// returns io.EOF is a write failure, not the end of the compressed stream.
+type eofWriter struct{ n int }
+
+func (w *eofWriter) Write(p []byte) (int, error) {
+	if len(p) > w.n {
+		p = p[:w.n]
+	}
+	return len(p), io.EOF
+}
+
+func TestWriteToDoesNotTreatWriterEOFAsEndOfStream(t *testing.T) {
+	var buf bytes.Buffer
+	w := NewWriter(&buf)
+	if _, err := w.Write([]byte("payload for checksum verification")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	z, err := NewReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dst := &eofWriter{n: 4}
+	n, err := z.WriteTo(dst)
+	if err != io.EOF {
+		t.Fatalf("first WriteTo: got %v, want io.EOF", err)
+	}
+	if n != 4 {
+		t.Fatalf("first WriteTo wrote %d bytes, want 4", n)
+	}
+
+	// A destination write failure is not truncated gzip input. Later calls
+	// must keep reporting the writer's io.EOF (identifiable via errors.Is),
+	// neither as a clean end of stream nor as io.ErrUnexpectedEOF.
+	n2, err2 := z.WriteTo(dst)
+	if !errors.Is(err2, io.EOF) || err2 == io.EOF || errors.Is(err2, io.ErrUnexpectedEOF) {
+		t.Errorf("second WriteTo: got %v, want a wrapped io.EOF", err2)
+	}
+	if n2 != 0 {
+		t.Errorf("second WriteTo wrote %d bytes, want 0", n2)
+	}
+	rn, rerr := z.Read(make([]byte, 4))
+	if !errors.Is(rerr, io.EOF) || rerr == io.EOF || errors.Is(rerr, io.ErrUnexpectedEOF) {
+		t.Errorf("Read after failed WriteTo: got %v, want a wrapped io.EOF", rerr)
+	}
+	if rn != 0 {
+		t.Errorf("Read after failed WriteTo returned %d bytes, want 0", rn)
 	}
 }

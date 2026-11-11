@@ -11,12 +11,12 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"io/ioutil"
+	"io/fs"
 	"math/rand"
 	"os"
-	"runtime"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 )
 
@@ -26,7 +26,7 @@ type WriteTest struct {
 	Name   string
 	Data   []byte
 	Method uint16
-	Mode   os.FileMode
+	Mode   fs.FileMode
 }
 
 var writeTests = []WriteTest{
@@ -46,19 +46,31 @@ var writeTests = []WriteTest{
 		Name:   "setuid",
 		Data:   []byte("setuid file"),
 		Method: Deflate,
-		Mode:   0755 | os.ModeSetuid,
+		Mode:   0755 | fs.ModeSetuid,
 	},
 	{
 		Name:   "setgid",
 		Data:   []byte("setgid file"),
 		Method: Deflate,
-		Mode:   0755 | os.ModeSetgid,
+		Mode:   0755 | fs.ModeSetgid,
 	},
 	{
 		Name:   "symlink",
 		Data:   []byte("../link/target"),
 		Method: Deflate,
-		Mode:   0755 | os.ModeSymlink,
+		Mode:   0755 | fs.ModeSymlink,
+	},
+	{
+		Name:   "device",
+		Data:   []byte("device file"),
+		Method: Deflate,
+		Mode:   0755 | fs.ModeDevice,
+	},
+	{
+		Name:   "chardevice",
+		Data:   []byte("char device file"),
+		Method: Deflate,
+		Mode:   0755 | fs.ModeDevice | fs.ModeCharDevice,
 	},
 }
 
@@ -240,7 +252,7 @@ func TestWriterTime(t *testing.T) {
 		t.Fatalf("unexpected Close error: %v", err)
 	}
 
-	want, err := ioutil.ReadFile("testdata/time-go.zip")
+	want, err := os.ReadFile("testdata/time-go.zip")
 	if err != nil {
 		t.Fatalf("unexpected ReadFile error: %v", err)
 	}
@@ -304,7 +316,7 @@ func TestWriterFlush(t *testing.T) {
 }
 
 func TestWriterDir(t *testing.T) {
-	w := NewWriter(ioutil.Discard)
+	w := NewWriter(io.Discard)
 	dw, err := w.Create("dir/")
 	if err != nil {
 		t.Fatal(err)
@@ -356,8 +368,8 @@ func TestWriterDirAttributes(t *testing.T) {
 	}
 }
 
-func TestWriterCopy(t *testing.T) {
-	want, err := ioutil.ReadFile("testdata/test.zip")
+func TestWriterCopyKP(t *testing.T) {
+	want, err := os.ReadFile("testdata/test.zip")
 	if err != nil {
 		t.Fatalf("unexpected ReadFile error: %v", err)
 	}
@@ -388,7 +400,7 @@ func TestWriterCopy(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected Open error: %v", err)
 		}
-		want, err := ioutil.ReadAll(wantR)
+		want, err := io.ReadAll(wantR)
 		if err != nil {
 			t.Fatalf("unexpected Copy error: %v", err)
 		}
@@ -398,7 +410,7 @@ func TestWriterCopy(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected Open error: %v", err)
 		}
-		got, err := ioutil.ReadAll(gotR)
+		got, err := io.ReadAll(gotR)
 		if err != nil {
 			t.Fatalf("unexpected Copy error: %v", err)
 		}
@@ -409,7 +421,7 @@ func TestWriterCopy(t *testing.T) {
 	}
 }
 
-func TestWriterCopy2(t *testing.T) {
+func TestWriterCopy(t *testing.T) {
 	// make a zip file
 	buf := new(bytes.Buffer)
 	w := NewWriter(buf)
@@ -543,7 +555,7 @@ func TestWriterCreateRaw(t *testing.T) {
 		if got.Method != want.method {
 			t.Errorf("%s: got Method %#x; want %#x", want.name, got.Method, want.method)
 		}
-		if got.Flags != want.flags && runtime.Version() >= "go1.16" {
+		if got.Flags != want.flags {
 			t.Errorf("%s: got Flags %#x; want %#x", want.name, got.Flags, want.flags)
 		}
 		if got.CRC32 != want.crc32 {
@@ -562,7 +574,7 @@ func TestWriterCreateRaw(t *testing.T) {
 			continue
 		}
 
-		buf, err := ioutil.ReadAll(r)
+		buf, err := io.ReadAll(r)
 		if err != nil {
 			t.Errorf("%s: ReadAll err = %v", got.Name, err)
 			continue
@@ -599,15 +611,15 @@ func testReadFile(t *testing.T, f *File, wt *WriteTest) {
 	testFileMode(t, f, wt.Mode)
 	rc, err := f.Open()
 	if err != nil {
-		t.Fatal("opening:", err)
+		t.Fatalf("opening %s: %v", f.Name, err)
 	}
-	b, err := ioutil.ReadAll(rc)
+	b, err := io.ReadAll(rc)
 	if err != nil {
-		t.Fatal("reading:", err)
+		t.Fatalf("reading %s: %v", f.Name, err)
 	}
 	err = rc.Close()
 	if err != nil {
-		t.Fatal("closing:", err)
+		t.Fatalf("closing %s: %v", f.Name, err)
 	}
 	if !bytes.Equal(b, wt.Data) {
 		t.Errorf("File contents %q, want %q", b, wt.Data)
@@ -620,7 +632,7 @@ func BenchmarkCompressedZipGarbage(b *testing.B) {
 	runOnce := func(buf *bytes.Buffer) {
 		buf.Reset()
 		zw := NewWriter(buf)
-		for j := 0; j < 3; j++ {
+		for range 3 {
 			w, _ := zw.CreateHeader(&FileHeader{
 				Name:   "foo",
 				Method: Deflate,
@@ -643,4 +655,72 @@ func BenchmarkCompressedZipGarbage(b *testing.B) {
 			runOnce(&buf)
 		}
 	})
+}
+
+func writeTestsToFS(tests []WriteTest) fs.FS {
+	fsys := fstest.MapFS{}
+	for _, wt := range tests {
+		fsys[wt.Name] = &fstest.MapFile{
+			Data: wt.Data,
+			Mode: wt.Mode,
+		}
+	}
+	return fsys
+}
+
+func TestWriterAddFS(t *testing.T) {
+	buf := new(bytes.Buffer)
+	w := NewWriter(buf)
+	tests := []WriteTest{
+		{
+			Name: "file.go",
+			Data: []byte("hello"),
+			Mode: 0644,
+		},
+		{
+			Name: "subfolder/another.go",
+			Data: []byte("world"),
+			Mode: 0644,
+		},
+	}
+	err := w.AddFS(writeTestsToFS(tests))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// read it back
+	r, err := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, wt := range tests {
+		testReadFile(t, r.File[i], &wt)
+	}
+}
+
+func TestIssue61875(t *testing.T) {
+	buf := new(bytes.Buffer)
+	w := NewWriter(buf)
+	tests := []WriteTest{
+		{
+			Name:   "symlink",
+			Data:   []byte("../link/target"),
+			Method: Deflate,
+			Mode:   0755 | fs.ModeSymlink,
+		},
+		{
+			Name:   "device",
+			Data:   []byte(""),
+			Method: Deflate,
+			Mode:   0755 | fs.ModeDevice,
+		},
+	}
+	err := w.AddFS(writeTestsToFS(tests))
+	if err == nil {
+		t.Errorf("expected error, got nil")
+	}
 }

@@ -9,7 +9,8 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"math/rand"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -33,24 +34,24 @@ type reverseBitsTest struct {
 }
 
 var deflateTests = []*deflateTest{
-	{[]byte{}, 0, []byte{0x3, 0x0}},
-	{[]byte{0x11}, BestCompression, []byte{0x12, 0x4, 0xc, 0x0}},
-	{[]byte{0x11}, BestCompression, []byte{0x12, 0x4, 0xc, 0x0}},
-	{[]byte{0x11}, BestCompression, []byte{0x12, 0x4, 0xc, 0x0}},
+	0: {[]byte{}, 0, []byte{0x3, 0x0}},
+	1: {[]byte{0x11}, BestCompression, []byte{0x12, 0x4, 0xc, 0x0}},
+	2: {[]byte{0x11}, BestCompression, []byte{0x12, 0x4, 0xc, 0x0}},
+	3: {[]byte{0x11}, BestCompression, []byte{0x12, 0x4, 0xc, 0x0}},
 
-	{[]byte{0x11}, 0, []byte{0x0, 0x1, 0x0, 0xfe, 0xff, 0x11, 0x3, 0x0}},
-	{[]byte{0x11, 0x12}, 0, []byte{0x0, 0x2, 0x0, 0xfd, 0xff, 0x11, 0x12, 0x3, 0x0}},
-	{[]byte{0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11}, 0,
+	4: {[]byte{0x11}, 0, []byte{0x0, 0x1, 0x0, 0xfe, 0xff, 0x11, 0x3, 0x0}},
+	5: {[]byte{0x11, 0x12}, 0, []byte{0x0, 0x2, 0x0, 0xfd, 0xff, 0x11, 0x12, 0x3, 0x0}},
+	6: {[]byte{0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11}, 0,
 		[]byte{0x0, 0x8, 0x0, 0xf7, 0xff, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x3, 0x0},
 	},
-	{[]byte{}, 1, []byte{0x3, 0x0}},
-	{[]byte{0x11}, BestCompression, []byte{0x12, 0x4, 0xc, 0x0}},
-	{[]byte{0x11, 0x12}, BestCompression, []byte{0x12, 0x14, 0x2, 0xc, 0x0}},
-	{[]byte{0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11}, BestCompression, []byte{0x12, 0x84, 0x2, 0xc0, 0x0}},
-	{[]byte{}, 9, []byte{0x3, 0x0}},
-	{[]byte{0x11}, 9, []byte{0x12, 0x4, 0xc, 0x0}},
-	{[]byte{0x11, 0x12}, 9, []byte{0x12, 0x14, 0x2, 0xc, 0x0}},
-	{[]byte{0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11}, 9, []byte{0x12, 0x84, 0x2, 0xc0, 0x0}},
+	7:  {[]byte{}, 1, []byte{0x3, 0x0}},
+	8:  {[]byte{0x11}, BestCompression, []byte{0x12, 0x4, 0xc, 0x0}},
+	9:  {[]byte{0x11, 0x12}, BestCompression, []byte{0x12, 0x14, 0x2, 0xc, 0x0}},
+	10: {[]byte{0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11}, BestCompression, []byte{0x12, 0x84, 0x1, 0xc0, 0x0}},
+	11: {[]byte{}, 9, []byte{0x3, 0x0}},
+	12: {[]byte{0x11}, 9, []byte{0x12, 0x4, 0xc, 0x0}},
+	13: {[]byte{0x11, 0x12}, 9, []byte{0x12, 0x14, 0x2, 0xc, 0x0}},
+	14: {[]byte{0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11}, 9, []byte{0x12, 0x84, 0x1, 0xc0, 0x0}},
 }
 
 var deflateInflateTests = []*deflateInflateTest{
@@ -120,7 +121,7 @@ func TestDeflate(t *testing.T) {
 		w.Write(h.in)
 		w.Close()
 		if !bytes.Equal(buf.Bytes(), h.out) {
-			t.Errorf("%d: Deflate(%d, %x) = \n%#v, want \n%#v", i, h.level, h.in, buf.Bytes(), h.out)
+			t.Errorf("%d: Deflate(%d, %x) got \n%#v, want \n%#v", i, h.level, h.in, buf.Bytes(), h.out)
 		}
 	}
 }
@@ -157,7 +158,8 @@ func TestVeryLongSparseChunk(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping sparse chunk during short test")
 	}
-	w, err := NewWriter(ioutil.Discard, 1)
+	var buf bytes.Buffer
+	w, err := NewWriter(&buf, 1)
 	if err != nil {
 		t.Errorf("NewWriter: %v", err)
 		return
@@ -165,6 +167,45 @@ func TestVeryLongSparseChunk(t *testing.T) {
 	if _, err = io.Copy(w, &sparseReader{l: 23e8}); err != nil {
 		t.Errorf("Compress failed: %v", err)
 		return
+	}
+	t.Log("Length:", buf.Len())
+}
+
+func TestOneMByte(t *testing.T) {
+	var input [1024 * 1024]byte
+
+	var compressedOutput bytes.Buffer
+	for level := HuffmanOnly; level <= BestCompression; level++ {
+		compressedOutput.Reset()
+		compressor, err := NewWriter(&compressedOutput, level)
+		if err != nil {
+			t.Fatalf("create: %s", err)
+		}
+		// Use single write...
+		if _, err := compressor.Write(input[:]); err != nil {
+			t.Fatalf("compress: %s", err)
+		}
+
+		if err := compressor.Close(); err != nil {
+			t.Fatalf("close: %s", err)
+		}
+
+		var decompressedOutput bytes.Buffer
+
+		decompresser := NewReader(&compressedOutput)
+		t.Log("level:", level, "compressed:", compressedOutput.Len())
+		// A window of zeros is about 1 KiB at every matching level (around 130 KiB
+		// with Huffman only); a regression in match selection would show up here.
+		if level >= BestSpeed && compressedOutput.Len() > 4096 {
+			t.Errorf("level %d: compressed %d bytes, expected a few KiB at most", level, compressedOutput.Len())
+		}
+		if _, err := io.Copy(&decompressedOutput, decompresser); err != nil {
+			t.Fatalf("decompress: %s", err)
+		}
+
+		if !bytes.Equal(input[:], decompressedOutput.Bytes()) {
+			t.Fatal("input and output do not match")
+		}
 	}
 }
 
@@ -236,7 +277,7 @@ func testSync(t *testing.T, level int, input []byte, name string) {
 	r := NewReader(buf)
 
 	// Write half the input and read back.
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		var lo, hi int
 		if i == 0 {
 			lo, hi = 0, (len(input)+1)/2
@@ -294,7 +335,7 @@ func testSync(t *testing.T, level int, input []byte, name string) {
 
 	// stream should work for ordinary reader too
 	r = NewReader(buf1)
-	out, err = ioutil.ReadAll(r)
+	out, err = io.ReadAll(r)
 	if err != nil {
 		t.Errorf("testSync: read: %s", err)
 		return
@@ -314,21 +355,23 @@ func testToFromWithLevelAndLimit(t *testing.T, level int, input []byte, name str
 	}
 	w.Write(input)
 	w.Close()
-	if limit > 0 && buffer.Len() > limit {
-		t.Errorf("level: %d, len(compress(data)) = %d > limit = %d", level, buffer.Len(), limit)
-		return
-	}
 	if limit > 0 {
 		t.Logf("level: %d - Size:%.2f%%, %d b\n", level, float64(buffer.Len()*100)/float64(limit), buffer.Len())
 	}
+	if limit > 0 && buffer.Len() > limit {
+		t.Errorf("level: %d, len(compress(data)) = %d > limit = %d", level, buffer.Len(), limit)
+	}
+
 	r := NewReader(&buffer)
-	out, err := ioutil.ReadAll(r)
+	out, err := io.ReadAll(r)
 	if err != nil {
 		t.Errorf("read: %s", err)
 		return
 	}
 	r.Close()
 	if !bytes.Equal(input, out) {
+		os.WriteFile("testdata/fails/"+t.Name()+".got", out, os.ModePerm)
+		os.WriteFile("testdata/fails/"+t.Name()+".want", input, os.ModePerm)
 		t.Errorf("decompress(compress(data)) != data: level=%d input=%s", level, name)
 		return
 	}
@@ -336,7 +379,7 @@ func testToFromWithLevelAndLimit(t *testing.T, level int, input []byte, name str
 }
 
 func testToFromWithLimit(t *testing.T, input []byte, name string, limit [11]int) {
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		testToFromWithLevelAndLimit(t, i, input, name, limit[i])
 	}
 	testToFromWithLevelAndLimit(t, -2, input, name, limit[10])
@@ -378,7 +421,7 @@ var deflateInflateStringTests = []deflateInflateStringTest{
 
 func TestDeflateInflateString(t *testing.T) {
 	for _, test := range deflateInflateStringTests {
-		gold, err := ioutil.ReadFile(test.filename)
+		gold, err := os.ReadFile(test.filename)
 		if err != nil {
 			t.Error(err)
 		}
@@ -415,7 +458,7 @@ func TestReaderDict(t *testing.T) {
 	w.Close()
 
 	r := NewReaderDict(&b, []byte(dict))
-	data, err := ioutil.ReadAll(r)
+	data, err := io.ReadAll(r)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -455,18 +498,100 @@ func TestWriterDict(t *testing.T) {
 	}
 }
 
+// TestSmallFlushKeepsHistory checks that a block too small to compress does not
+// discard the match history, so data written after it, up to Close, can still
+// be matched against data written before it.
+// See https://go.dev/issue/81542.
+func TestSmallFlushKeepsHistory(t *testing.T) {
+	const msg = `{"id":"a7f3e9c2","name":"Wynn Kessler","age":34,"active":true,` +
+		`"tags":["alpha","beta","gamma"],"location":{"city":"Denver","zip":"80202"},` +
+		`"score":87.5,"joined":"2024-03-15T10:22:00Z","meta":{"verified":true,"level":3}}`
+
+	type writerCase struct {
+		name   string
+		create func(io.Writer) (*Writer, error)
+	}
+	var writers []writerCase
+	for level := 1; level <= 9; level++ {
+		writers = append(writers, writerCase{fmt.Sprintf("level=%d", level),
+			func(w io.Writer) (*Writer, error) { return NewWriter(w, level) }})
+	}
+	// Custom windows use their own encoder.
+	writers = append(writers, writerCase{"window=1024",
+		func(w io.Writer) (*Writer, error) { return NewWriterWindow(w, 1024) }})
+
+	// Separators on both sides of minNonLiteralBlockSize, below which the
+	// encoder does not look for matches at all.
+	for _, sep := range []string{"Testing", strings.Repeat("separator", 5)} {
+		for _, wc := range writers {
+			t.Run(fmt.Sprintf("%s/sep=%d", wc.name, len(sep)), func(t *testing.T) {
+				var buf bytes.Buffer
+				w, err := wc.create(&buf)
+				if err != nil {
+					t.Fatalf("%s: %v", wc.name, err)
+				}
+				// Reuse the writer, so that a Close leaving the compressor in
+				// its no-more-data state would show up here.
+				var first []byte
+				for range 2 {
+					buf.Reset()
+					write := func(s string) int {
+						before := buf.Len()
+						if _, err := io.WriteString(w, s); err != nil {
+							t.Fatalf("Write: %v", err)
+						}
+						if err := w.Flush(); err != nil {
+							t.Fatalf("Flush: %v", err)
+						}
+						return buf.Len() - before
+					}
+					write(msg)
+					write(sep)
+					if n := write(msg); n > 40 {
+						t.Errorf("repeat of a %d byte message took %d bytes, want it emitted as a match", len(msg), n)
+					}
+					tail := msg[:100]
+					before := buf.Len()
+					if _, err := io.WriteString(w, tail); err != nil {
+						t.Fatalf("Write: %v", err)
+					}
+					if err := w.Close(); err != nil {
+						t.Fatalf("Close: %v", err)
+					}
+					if n := buf.Len() - before; n > 40 {
+						t.Errorf("repeat of a %d byte tail at Close took %d bytes, want it emitted as a match", len(tail), n)
+					}
+					got, err := io.ReadAll(NewReader(bytes.NewReader(buf.Bytes())))
+					if err != nil {
+						t.Fatalf("ReadAll: %v", err)
+					}
+					if want := msg + sep + msg + tail; string(got) != want {
+						t.Errorf("roundtrip mismatch:\ngot  %q\nwant %q", got, want)
+					}
+					if first == nil {
+						first = bytes.Clone(buf.Bytes())
+					} else if !bytes.Equal(first, buf.Bytes()) {
+						t.Errorf("output after Reset differs: %d bytes, want %d", buf.Len(), len(first))
+					}
+					w.Reset(&buf)
+				}
+			})
+		}
+	}
+}
+
 // See http://code.google.com/p/go/issues/detail?id=2508
 func TestRegression2508(t *testing.T) {
 	if testing.Short() {
 		t.Logf("test disabled with -short")
 		return
 	}
-	w, err := NewWriter(ioutil.Discard, 1)
+	w, err := NewWriter(io.Discard, 1)
 	if err != nil {
 		t.Fatalf("NewWriter: %v", err)
 	}
 	buf := make([]byte, 1024)
-	for i := 0; i < 131072; i++ {
+	for range 131072 {
 		if _, err := w.Write(buf); err != nil {
 			t.Fatalf("writer failed: %v", err)
 		}
@@ -482,17 +607,17 @@ func TestWriterReset(t *testing.T) {
 		if testing.Short() && level > 1 {
 			break
 		}
-		w, err := NewWriter(ioutil.Discard, level)
+		w, err := NewWriter(io.Discard, level)
 		if err != nil {
 			t.Fatalf("NewWriter: %v", err)
 		}
 		buf := []byte("hello world")
-		for i := 0; i < 1024; i++ {
+		for range 1024 {
 			w.Write(buf)
 		}
-		w.Reset(ioutil.Discard)
+		w.Reset(io.Discard)
 
-		wref, err := NewWriter(ioutil.Discard, level)
+		wref, err := NewWriter(io.Discard, level)
 		if err != nil {
 			t.Fatalf("NewWriter: %v", err)
 		}
@@ -534,6 +659,14 @@ func TestWriterReset(t *testing.T) {
 			return w2, nil
 		})
 	}
+	testResetOutput(t, fmt.Sprint("dict-reset-window"), func(w io.Writer) (*Writer, error) {
+		w2, err := NewWriterWindow(nil, 1024)
+		if err != nil {
+			return w2, err
+		}
+		w2.ResetDict(w, dict)
+		return w2, nil
+	})
 }
 
 func testResetOutput(t *testing.T, name string, newWriter func(w io.Writer) (*Writer, error)) {
@@ -544,7 +677,7 @@ func testResetOutput(t *testing.T, name string, newWriter func(w io.Writer) (*Wr
 			t.Fatalf("NewWriter: %v", err)
 		}
 		b := []byte("hello world - how are you doing?")
-		for i := 0; i < 1024; i++ {
+		for range 1024 {
 			w.Write(b)
 		}
 		w.Close()
@@ -552,7 +685,7 @@ func testResetOutput(t *testing.T, name string, newWriter func(w io.Writer) (*Wr
 
 		buf2 := new(bytes.Buffer)
 		w.Reset(buf2)
-		for i := 0; i < 1024; i++ {
+		for range 1024 {
 			w.Write(b)
 		}
 		w.Close()
@@ -644,7 +777,7 @@ func TestBestSpeed(t *testing.T) {
 				}
 
 				r := NewReader(buf)
-				got, err := ioutil.ReadAll(r)
+				got, err := io.ReadAll(r)
 				if err != nil {
 					t.Errorf("i=%d, firstN=%d, flush=%t: ReadAll: %v", i, firstN, flush, err)
 					continue
@@ -657,5 +790,48 @@ func TestBestSpeed(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// TestBestCompressionRuns checks that the level 9 gain estimate does not
+// reject matches on bytes that are missing from the first part of the window:
+// data made of long runs of varying byte values compressed about 7x worse at
+// level 9 than at level 8 once the input exceeded the first flate block.
+func TestBestCompressionRuns(t *testing.T) {
+	rng := rand.New(rand.NewSource(7))
+	input := make([]byte, 70000)
+	for i := 0; i < len(input); {
+		run := 1 + rng.Intn(300)
+		v := byte(rng.Intn(256))
+		for j := 0; j < run && i < len(input); j++ {
+			input[i] = v
+			i++
+		}
+	}
+	sizes := make(map[int]int)
+	for _, level := range []int{8, 9} {
+		var buf bytes.Buffer
+		w, err := NewWriter(&buf, level)
+		if err != nil {
+			t.Fatalf("NewWriter(%d): %v", level, err)
+		}
+		if _, err := w.Write(input); err != nil {
+			t.Fatalf("Write(%d): %v", level, err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatalf("Close(%d): %v", level, err)
+		}
+		sizes[level] = buf.Len()
+		out, err := io.ReadAll(NewReader(&buf))
+		if err != nil {
+			t.Fatalf("decompress(%d): %v", level, err)
+		}
+		if !bytes.Equal(out, input) {
+			t.Fatalf("level %d: decompressed output differs from input", level)
+		}
+	}
+	t.Logf("level 8: %d bytes, level 9: %d bytes", sizes[8], sizes[9])
+	if sizes[9] > sizes[8]*3/2 {
+		t.Errorf("level 9 output (%d bytes) is much larger than level 8 output (%d bytes)", sizes[9], sizes[8])
 	}
 }

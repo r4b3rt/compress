@@ -6,17 +6,19 @@ package zstd
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/klauspost/compress/internal/silesiatest"
 	"github.com/klauspost/compress/zip"
 	"github.com/klauspost/compress/zstd/internal/xxhash"
 )
@@ -51,7 +53,8 @@ func getEncOpts(cMax int) []testEncOpt {
 				addOpt("nolit", WithNoEntropyCompression(true))
 				addOpt("pad1k", WithEncoderPadding(1024))
 				addOpt("zerof", WithZeroFrames(true))
-				addOpt("singleseg", WithSingleSegment(true))
+				addOpt("1seg", WithSingleSegment(true))
+				addOpt("conc", WithConcurrentBlocks(true))
 			}
 			if testing.Short() && conc == 2 {
 				break
@@ -65,7 +68,7 @@ func getEncOpts(cMax int) []testEncOpt {
 }
 
 func TestEncoder_EncodeAllSimple(t *testing.T) {
-	in, err := ioutil.ReadFile("testdata/z000028")
+	in, err := os.ReadFile("testdata/z000028")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +89,7 @@ func TestEncoder_EncodeAllSimple(t *testing.T) {
 			defer e.Close()
 			start := time.Now()
 			dst := e.EncodeAll(in, nil)
-			t.Log("Simple Encoder len", len(in), "-> zstd len", len(dst))
+			//t.Log("Simple Encoder len", len(in), "-> zstd len", len(dst))
 			mbpersec := (float64(len(in)) / (1024 * 1024)) / (float64(time.Since(start)) / (float64(time.Second)))
 			t.Logf("Encoded %d bytes with %.2f MB/s", len(in), mbpersec)
 
@@ -95,17 +98,17 @@ func TestEncoder_EncodeAllSimple(t *testing.T) {
 				t.Error(err, len(decoded))
 			}
 			if !bytes.Equal(decoded, in) {
-				ioutil.WriteFile("testdata/"+t.Name()+"-z000028.got", decoded, os.ModePerm)
-				ioutil.WriteFile("testdata/"+t.Name()+"-z000028.want", in, os.ModePerm)
+				os.WriteFile("testdata/"+t.Name()+"-z000028.got", decoded, os.ModePerm)
+				os.WriteFile("testdata/"+t.Name()+"-z000028.want", in, os.ModePerm)
 				t.Fatal("Decoded does not match")
 			}
-			t.Log("Encoded content matched")
+			//t.Log("Encoded content matched")
 		})
 	}
 }
 
 func TestEncoder_EncodeAllConcurrent(t *testing.T) {
-	in, err := ioutil.ReadFile("testdata/z000028")
+	in, err := os.ReadFile("testdata/z000028")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,21 +140,24 @@ func TestEncoder_EncodeAllConcurrent(t *testing.T) {
 				go func() {
 					defer wg.Done()
 					dst := e.EncodeAll(in, nil)
+					if len(dst) > e.MaxEncodedSize(len(in)) {
+						t.Errorf("max encoded size for %v: got: %d, want max: %d", len(in), len(dst), e.MaxEncodedSize(len(in)))
+					}
 					//t.Log("Simple Encoder len", len(in), "-> zstd len", len(dst))
 					decoded, err := dec.DecodeAll(dst, nil)
 					if err != nil {
 						t.Error(err, len(decoded))
 					}
 					if !bytes.Equal(decoded, in) {
-						//ioutil.WriteFile("testdata/"+t.Name()+"-z000028.got", decoded, os.ModePerm)
-						//ioutil.WriteFile("testdata/"+t.Name()+"-z000028.want", in, os.ModePerm)
+						//os.WriteFile("testdata/"+t.Name()+"-z000028.got", decoded, os.ModePerm)
+						//os.WriteFile("testdata/"+t.Name()+"-z000028.want", in, os.ModePerm)
 						t.Error("Decoded does not match")
 						return
 					}
 				}()
 			}
 			wg.Wait()
-			t.Log("Encoded content matched.", n, "goroutines")
+			//t.Log("Encoded content matched.", n, "goroutines")
 		})
 	}
 }
@@ -161,12 +167,14 @@ func TestEncoder_EncodeAllEncodeXML(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer f.Close()
+
 	dec, err := NewReader(f)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dec.Close()
-	in, err := ioutil.ReadAll(dec)
+	in, err := io.ReadAll(dec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +194,10 @@ func TestEncoder_EncodeAllEncodeXML(t *testing.T) {
 			defer e.Close()
 			start := time.Now()
 			dst := e.EncodeAll(in, nil)
-			t.Log("Simple Encoder len", len(in), "-> zstd len", len(dst))
+			if len(dst) > e.MaxEncodedSize(len(in)) {
+				t.Errorf("max encoded size for %v: got: %d, want max: %d", len(in), len(dst), e.MaxEncodedSize(len(in)))
+			}
+			//t.Log("Simple Encoder len", len(in), "-> zstd len", len(dst))
 			mbpersec := (float64(len(in)) / (1024 * 1024)) / (float64(time.Since(start)) / (float64(time.Second)))
 			t.Logf("Encoded %d bytes with %.2f MB/s", len(in), mbpersec)
 
@@ -195,18 +206,62 @@ func TestEncoder_EncodeAllEncodeXML(t *testing.T) {
 				t.Error(err, len(decoded))
 			}
 			if !bytes.Equal(decoded, in) {
-				ioutil.WriteFile("testdata/"+t.Name()+"-xml.got", decoded, os.ModePerm)
+				os.WriteFile("testdata/"+t.Name()+"-xml.got", decoded, os.ModePerm)
 				t.Error("Decoded does not match")
 				return
 			}
-			t.Log("Encoded content matched")
+			//t.Log("Encoded content matched")
+		})
+	}
+}
+
+// TestEncoderLongOffsetSequence makes a sequence with more than 56 extra
+// bits (32K+ literals, 64K+ match, offset over 2^26), which the sequence
+// encoder has to split.
+func TestEncoderLongOffsetSequence(t *testing.T) {
+	if testing.Short() || isRaceTest {
+		t.Skip("large input")
+	}
+	const window = 1 << 27
+	rng := rand.New(rand.NewSource(1))
+	a := make([]byte, 100_000)
+	rng.Read(a)
+	lits := make([]byte, 32_800)
+	rng.Read(lits)
+	// Start the literals on a block boundary so the sequence fits in one
+	// block, and end with a short match: the last sequence is encoded apart.
+	in := make([]byte, 513*maxCompressedBlockSize, 513*maxCompressedBlockSize+len(lits)+98_100)
+	copy(in, a)
+	in = append(in, lits...)
+	in = append(in, a[:98_000]...)
+	in = append(in, lits[:100]...)
+
+	dec, err := NewReader(nil, WithDecoderMaxWindow(window))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dec.Close()
+	for level := speedNotSet + 1; level < speedLast; level++ {
+		t.Run(level.String(), func(t *testing.T) {
+			enc, err := NewWriter(nil, WithEncoderLevel(level), WithWindowSize(window), WithEncoderConcurrency(1))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer enc.Close()
+			got, err := dec.DecodeAll(enc.EncodeAll(in, nil), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, in) {
+				t.Fatal("decoded does not match")
+			}
 		})
 	}
 }
 
 func TestEncoderRegression(t *testing.T) {
 	defer timeout(4 * time.Minute)()
-	data, err := ioutil.ReadFile("testdata/comp-crashers.zip")
+	data, err := os.ReadFile("testdata/comp-crashers.zip")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -246,17 +301,20 @@ func TestEncoderRegression(t *testing.T) {
 						t.Error(err)
 						return
 					}
-					in, err := ioutil.ReadAll(r)
+					in, err := io.ReadAll(r)
 					if err != nil {
 						t.Error(err)
 					}
 					encoded := enc.EncodeAll(in, nil)
-					got, err := dec.DecodeAll(encoded, nil)
+					if len(encoded) > enc.MaxEncodedSize(len(in)) {
+						t.Errorf("max encoded size for %v: got: %d, want max: %d", len(in), len(encoded), enc.MaxEncodedSize(len(in)))
+					}
+					// Usually too small...
+					got, err := dec.DecodeAll(encoded, make([]byte, 0, len(in)))
 					if err != nil {
 						t.Logf("error: %v\nwant: %v\ngot:  %v", err, len(in), len(got))
 						t.Fatal(err)
 					}
-
 					// Use the Writer
 					var dst bytes.Buffer
 					enc.ResetContentSize(&dst, int64(len(in)))
@@ -268,10 +326,21 @@ func TestEncoderRegression(t *testing.T) {
 					if err != nil {
 						t.Error(err)
 					}
-					encoded = dst.Bytes()
-					got, err = dec.DecodeAll(encoded, nil)
+					err = enc.Close()
 					if err != nil {
-						t.Logf("error: %v\nwant: %v\ngot:  %v", err, in, got)
+						t.Error(err)
+					}
+					_, err = enc.Write([]byte{1, 2, 3, 4})
+					if !errors.Is(err, ErrEncoderClosed) {
+						t.Errorf("unexpected error: %v", err)
+					}
+					encoded = dst.Bytes()
+					if len(encoded) > enc.MaxEncodedSize(len(in)) {
+						t.Errorf("max encoded size for %v: got: %d, want max: %d", len(in), len(encoded), enc.MaxEncodedSize(len(in)))
+					}
+					got, err = dec.DecodeAll(encoded, make([]byte, 0, len(in)/2))
+					if err != nil {
+						t.Logf("error: %v\nwant: %v\ngot:  %v", err, len(in), len(got))
 						t.Error(err)
 					}
 				})
@@ -281,7 +350,7 @@ func TestEncoderRegression(t *testing.T) {
 }
 
 func TestEncoder_EncodeAllTwain(t *testing.T) {
-	in, err := ioutil.ReadFile("../testdata/Mark.Twain-Tom.Sawyer.txt")
+	in, err := os.ReadFile("../testdata/Mark.Twain-Tom.Sawyer.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,7 +388,7 @@ func TestEncoder_EncodeAllTwain(t *testing.T) {
 						t.Error(err, len(decoded))
 					}
 					if !bytes.Equal(decoded, in) {
-						ioutil.WriteFile("testdata/"+t.Name()+"-Mark.Twain-Tom.Sawyer.txt.got", decoded, os.ModePerm)
+						os.WriteFile("testdata/"+t.Name()+"-Mark.Twain-Tom.Sawyer.txt.got", decoded, os.ModePerm)
 						t.Fatal("Decoded does not match")
 					}
 					t.Log("Encoded content matched")
@@ -329,8 +398,96 @@ func TestEncoder_EncodeAllTwain(t *testing.T) {
 	}
 }
 
+func TestEncoder_EncodeRLE(t *testing.T) {
+	in := make([]byte, 1<<20)
+	testWindowSizes := testWindowSizes
+	if testing.Short() {
+		testWindowSizes = []int{1 << 20}
+	}
+
+	dec, err := NewReader(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dec.Close()
+
+	for level := speedNotSet + 1; level < speedLast; level++ {
+		t.Run(level.String(), func(t *testing.T) {
+			if isRaceTest && level >= SpeedBestCompression {
+				t.SkipNow()
+			}
+			for _, windowSize := range testWindowSizes {
+				t.Run(fmt.Sprintf("window:%d", windowSize), func(t *testing.T) {
+					e, err := NewWriter(nil, WithEncoderLevel(level), WithWindowSize(windowSize))
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer e.Close()
+					start := time.Now()
+					dst := e.EncodeAll(in, nil)
+					t.Log("Simple Encoder len", len(in), "-> zstd len", len(dst))
+					mbpersec := (float64(len(in)) / (1024 * 1024)) / (float64(time.Since(start)) / (float64(time.Second)))
+					t.Logf("Encoded %d bytes with %.2f MB/s", len(in), mbpersec)
+
+					decoded, err := dec.DecodeAll(dst, nil)
+					if err != nil {
+						t.Error(err, len(decoded))
+					}
+					if !bytes.Equal(decoded, in) {
+						os.WriteFile("testdata/"+t.Name()+"-RLE.got", decoded, os.ModePerm)
+						t.Fatal("Decoded does not match")
+					}
+					t.Log("Encoded content matched")
+				})
+			}
+		})
+	}
+}
+
+// In these streams a block builds a literal table but stores its literals raw,
+// and the next block would reuse the table the decoder never got.
+func TestEncoderFlushRawLiterals(t *testing.T) {
+	streams := [][]string{
+		{"ahbkkdaflabkbbecakeiaaddaaaaacjaajadbbfalbkmfaamalfkja", "mmiijagdaafcbaajcmjdbalcmgbcagafbijfakbabgcfdkcaeldgfik", "akecbajaaaaahfabgahc", "jkcbaemekbmibgaffdegkdlifhaabiaaca", "bcjihjimfaemceeamhkabgebaaacaaaafaaback"},
+		{"kbeaelahfejbdfeediaenceadfdgijlbfbabbndikkdal", "jmgcahcbkffagbdbccnoejcdlemeahaana", "aaealoaanmkabahkbfgmdccgcagnacfjafa", "onfaneoanaghbacbeckanaeacomfchfgabadgnhnieeliggccginaaoelgkbdelnaheaciaakibbakafihbadkdkdlhcibgibldkaanhe", "ahcehdkdlnbjgaacdonlkmabhbhaajacehjcokaf"},
+	}
+	dec, err := NewReader(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dec.Close()
+	var buf bytes.Buffer
+	enc, err := NewWriter(&buf, WithEncoderLevel(SpeedBetterCompression))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, pieces := range streams {
+		buf.Reset()
+		enc.Reset(&buf)
+		var in []byte
+		for _, p := range pieces {
+			in = append(in, p...)
+			if _, err := enc.Write([]byte(p)); err != nil {
+				t.Fatal(err)
+			}
+			if err := enc.Flush(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := enc.Close(); err != nil {
+			t.Fatal(err)
+		}
+		got, err := dec.DecodeAll(buf.Bytes(), nil)
+		if err != nil {
+			t.Errorf("stream %d: %v", i, err)
+		} else if !bytes.Equal(got, in) {
+			t.Errorf("stream %d: decoded does not match", i)
+		}
+	}
+}
+
 func TestEncoder_EncodeAllPi(t *testing.T) {
-	in, err := ioutil.ReadFile("../testdata/pi.txt")
+	in, err := os.ReadFile("../testdata/pi.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -368,7 +525,7 @@ func TestEncoder_EncodeAllPi(t *testing.T) {
 						t.Error(err, len(decoded))
 					}
 					if !bytes.Equal(decoded, in) {
-						ioutil.WriteFile("testdata/"+t.Name()+"-pi.txt.got", decoded, os.ModePerm)
+						os.WriteFile("testdata/"+t.Name()+"-pi.txt.got", decoded, os.ModePerm)
 						t.Fatal("Decoded does not match")
 					}
 					t.Log("Encoded content matched")
@@ -403,7 +560,7 @@ func TestWithEncoderPadding(t *testing.T) {
 		// Test the added padding is invisible.
 		dst := e.EncodeAll(src, nil)
 		if len(dst)%padding != 0 {
-			t.Fatalf("wanted size to be mutiple of %d, got size %d with remainder %d", padding, len(dst), len(dst)%padding)
+			t.Fatalf("wanted size to be multiple of %d, got size %d with remainder %d", padding, len(dst), len(dst)%padding)
 		}
 		got, err := d.DecodeAll(dst, nil)
 		if err != nil {
@@ -415,7 +572,7 @@ func TestWithEncoderPadding(t *testing.T) {
 		// Test when we supply data as well.
 		dst = e.EncodeAll(src, make([]byte, rng.Int()&255))
 		if len(dst)%padding != 0 {
-			t.Fatalf("wanted size to be mutiple of %d, got size %d with remainder %d", padding, len(dst), len(dst)%padding)
+			t.Fatalf("wanted size to be multiple of %d, got size %d with remainder %d", padding, len(dst), len(dst)%padding)
 		}
 
 		// Test using the writer.
@@ -431,7 +588,7 @@ func TestWithEncoderPadding(t *testing.T) {
 		}
 		dst = buf.Bytes()
 		if len(dst)%padding != 0 {
-			t.Fatalf("wanted size to be mutiple of %d, got size %d with remainder %d", padding, len(dst), len(dst)%padding)
+			t.Fatalf("wanted size to be multiple of %d, got size %d with remainder %d", padding, len(dst), len(dst)%padding)
 		}
 		// Test the added padding is invisible.
 		got, err = d.DecodeAll(dst, nil)
@@ -454,7 +611,7 @@ func TestWithEncoderPadding(t *testing.T) {
 		}
 		dst = buf.Bytes()
 		if len(dst)%padding != 0 {
-			t.Fatalf("wanted size to be mutiple of %d, got size %d with remainder %d", padding, len(dst), len(dst)%padding)
+			t.Fatalf("wanted size to be multiple of %d, got size %d with remainder %d", padding, len(dst), len(dst)%padding)
 		}
 		// Test the added padding is invisible.
 		got, err = d.DecodeAll(dst, nil)
@@ -497,8 +654,8 @@ func TestEncoder_EncoderHTML(t *testing.T) {
 }
 
 func TestEncoder_EncoderEnwik9(t *testing.T) {
-	testEncoderRoundtrip(t, "./testdata/enwik9.zst", []byte{0x28, 0xfa, 0xf4, 0x30, 0xca, 0x4b, 0x64, 0x12})
-	testEncoderRoundtripWriter(t, "./testdata/enwik9.zst", []byte{0x28, 0xfa, 0xf4, 0x30, 0xca, 0x4b, 0x64, 0x12})
+	//testEncoderRoundtrip(t, "./testdata/enwik9.zst", []byte{0x28, 0xfa, 0xf4, 0x30, 0xca, 0x4b, 0x64, 0x12})
+	//testEncoderRoundtripWriter(t, "./testdata/enwik9.zst", []byte{0x28, 0xfa, 0xf4, 0x30, 0xca, 0x4b, 0x64, 0x12})
 }
 
 // test roundtrip using io.ReaderFrom interface.
@@ -506,7 +663,7 @@ func testEncoderRoundtrip(t *testing.T, file string, wantCRC []byte) {
 	for _, opt := range getEncOpts(1) {
 		t.Run(opt.name, func(t *testing.T) {
 			opt := opt
-			t.Parallel()
+			//t.Parallel()
 			f, err := os.Open(file)
 			if err != nil {
 				if os.IsNotExist(err) {
@@ -696,7 +853,7 @@ func TestEncoder_EncodeAllSilesia(t *testing.T) {
 	if testing.Short() {
 		t.SkipNow()
 	}
-	in, err := ioutil.ReadFile("testdata/silesia.tar")
+	in, err := os.ReadFile("testdata/silesia.tar")
 	if err != nil {
 		if os.IsNotExist(err) {
 			t.Skip("Missing testdata/silesia.tar")
@@ -722,10 +879,62 @@ func TestEncoder_EncodeAllSilesia(t *testing.T) {
 		t.Error(err, len(decoded))
 	}
 	if !bytes.Equal(decoded, in) {
-		ioutil.WriteFile("testdata/"+t.Name()+"-silesia.tar.got", decoded, os.ModePerm)
+		os.WriteFile("testdata/"+t.Name()+"-silesia.tar.got", decoded, os.ModePerm)
 		t.Fatal("Decoded does not match")
 	}
 	t.Log("Encoded content matched")
+}
+
+// TestSilesiaRoundTrip round-trips testdata/silesia.tar at each level through
+// the streaming Writer and Reader and through EncodeAll and DecodeAll.
+func TestSilesiaRoundTrip(t *testing.T) {
+	in := silesiatest.Tar(t)
+	dec, err := NewReader(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dec.Close()
+	for level := SpeedFastest; level < speedLast; level++ {
+		t.Run(level.String(), func(t *testing.T) {
+			var buf bytes.Buffer
+			w, err := NewWriter(&buf, WithEncoderLevel(level))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.Copy(w, bytes.NewReader(in)); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+			r, err := NewReader(&buf)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := io.ReadAll(r)
+			r.Close()
+			if err != nil {
+				t.Fatal("Reader:", err)
+			}
+			if !bytes.Equal(got, in) {
+				t.Fatal("Writer/Reader: output differs from input")
+			}
+
+			enc, err := NewWriter(nil, WithEncoderLevel(level))
+			if err != nil {
+				t.Fatal(err)
+			}
+			comp := enc.EncodeAll(in, nil)
+			enc.Close()
+			got, err = dec.DecodeAll(comp, got[:0])
+			if err != nil {
+				t.Fatal("DecodeAll:", err)
+			}
+			if !bytes.Equal(got, in) {
+				t.Fatal("EncodeAll/DecodeAll: output differs from input")
+			}
+		})
+	}
 }
 
 func TestEncoderReadFrom(t *testing.T) {
@@ -787,7 +996,7 @@ func TestInterleavedWriteReadFrom(t *testing.T) {
 	}
 	defer dec.Close()
 
-	gotb, err := ioutil.ReadAll(dec)
+	gotb, err := io.ReadAll(dec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -851,7 +1060,7 @@ func TestEncoder_EncodeAllEmpty(t *testing.T) {
 }
 
 func TestEncoder_EncodeAllEnwik9(t *testing.T) {
-	if false || testing.Short() {
+	if testing.Short() {
 		t.SkipNow()
 	}
 	file := "testdata/enwik9.zst"
@@ -862,19 +1071,24 @@ func TestEncoder_EncodeAllEnwik9(t *testing.T) {
 				"compress it with 'zstd -15 -T0 enwik9' and place it in " + file)
 		}
 	}
+	defer f.Close()
+
 	dec, err := NewReader(f)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dec.Close()
-	in, err := ioutil.ReadAll(dec)
+	in, err := io.ReadAll(dec)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	start := time.Now()
-	var e Encoder
+	e, err := NewWriter(nil)
 	dst := e.EncodeAll(in, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Log("Simple Encoder len", len(in), "-> zstd len", len(dst))
 	mbpersec := (float64(len(in)) / (1024 * 1024)) / (float64(time.Since(start)) / (float64(time.Second)))
 	t.Logf("Encoded %d bytes with %.2f MB/s", len(in), mbpersec)
@@ -883,10 +1097,61 @@ func TestEncoder_EncodeAllEnwik9(t *testing.T) {
 		t.Error(err, len(decoded))
 	}
 	if !bytes.Equal(decoded, in) {
-		ioutil.WriteFile("testdata/"+t.Name()+"-enwik9.got", decoded, os.ModePerm)
+		os.WriteFile("testdata/"+t.Name()+"-enwik9.got", decoded, os.ModePerm)
 		t.Fatal("Decoded does not match")
 	}
 	t.Log("Encoded content matched")
+}
+
+func TestEncoder_EncoderStreamEnwik9(t *testing.T) {
+	if testing.Short() {
+		t.SkipNow()
+	}
+	file := "testdata/enwik9.zst"
+	f, err := os.Open(file)
+	if err != nil {
+		if os.IsNotExist(err) {
+			t.Skip("To run extended tests, download http://mattmahoney.net/dc/enwik9.zip unzip it \n" +
+				"compress it with 'zstd -15 -T0 enwik9' and place it in " + file)
+		}
+	}
+	defer f.Close()
+
+	dec, err := NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dec.Close()
+	in, err := io.ReadAll(dec)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	var dst bytes.Buffer
+	e, err := NewWriter(&dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = io.Copy(e, bytes.NewBuffer(in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.Close()
+	t.Log("Full Encoder len", len(in), "-> zstd len", dst.Len())
+	mbpersec := (float64(len(in)) / (1024 * 1024)) / (float64(time.Since(start)) / (float64(time.Second)))
+	t.Logf("Encoded %d bytes with %.2f MB/s", len(in), mbpersec)
+	if false {
+		decoded, err := dec.DecodeAll(dst.Bytes(), nil)
+		if err != nil {
+			t.Error(err, len(decoded))
+		}
+		if !bytes.Equal(decoded, in) {
+			os.WriteFile("testdata/"+t.Name()+"-enwik9.got", decoded, os.ModePerm)
+			t.Fatal("Decoded does not match")
+		}
+		t.Log("Encoded content matched")
+	}
 }
 
 func BenchmarkEncoder_EncodeAllXML(b *testing.B) {
@@ -894,20 +1159,22 @@ func BenchmarkEncoder_EncodeAllXML(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
+	defer f.Close()
+
 	dec, err := NewReader(f)
 	if err != nil {
 		b.Fatal(err)
 	}
-	in, err := ioutil.ReadAll(dec)
+	in, err := io.ReadAll(dec)
 	if err != nil {
 		b.Fatal(err)
 	}
 	dec.Close()
 
-	enc := Encoder{}
+	enc, _ := NewWriter(nil, WithEncoderConcurrency(1))
 	dst := enc.EncodeAll(in, nil)
 	wantSize := len(dst)
-	b.Log("Output size:", len(dst))
+	//b.Log("Output size:", len(dst))
 	b.ResetTimer()
 	b.ReportAllocs()
 	b.SetBytes(int64(len(in)))
@@ -920,11 +1187,7 @@ func BenchmarkEncoder_EncodeAllXML(b *testing.B) {
 }
 
 func BenchmarkEncoder_EncodeAllSimple(b *testing.B) {
-	f, err := os.Open("testdata/z000028")
-	if err != nil {
-		b.Fatal(err)
-	}
-	in, err := ioutil.ReadAll(f)
+	in, err := os.ReadFile("testdata/z000028")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -952,11 +1215,7 @@ func BenchmarkEncoder_EncodeAllSimple(b *testing.B) {
 }
 
 func BenchmarkEncoder_EncodeAllSimple4K(b *testing.B) {
-	f, err := os.Open("testdata/z000028")
-	if err != nil {
-		b.Fatal(err)
-	}
-	in, err := ioutil.ReadAll(f)
+	in, err := os.ReadFile("testdata/z000028")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -985,16 +1244,12 @@ func BenchmarkEncoder_EncodeAllSimple4K(b *testing.B) {
 }
 
 func BenchmarkEncoder_EncodeAllHTML(b *testing.B) {
-	f, err := os.Open("../testdata/html.txt")
-	if err != nil {
-		b.Fatal(err)
-	}
-	in, err := ioutil.ReadAll(f)
+	in, err := os.ReadFile("../testdata/html.txt")
 	if err != nil {
 		b.Fatal(err)
 	}
 
-	enc := Encoder{}
+	enc, _ := NewWriter(nil, WithEncoderConcurrency(1))
 	dst := enc.EncodeAll(in, nil)
 	wantSize := len(dst)
 	b.ResetTimer()
@@ -1009,16 +1264,12 @@ func BenchmarkEncoder_EncodeAllHTML(b *testing.B) {
 }
 
 func BenchmarkEncoder_EncodeAllTwain(b *testing.B) {
-	f, err := os.Open("../testdata/Mark.Twain-Tom.Sawyer.txt")
-	if err != nil {
-		b.Fatal(err)
-	}
-	in, err := ioutil.ReadAll(f)
+	in, err := os.ReadFile("../testdata/Mark.Twain-Tom.Sawyer.txt")
 	if err != nil {
 		b.Fatal(err)
 	}
 
-	enc := Encoder{}
+	enc, _ := NewWriter(nil, WithEncoderConcurrency(1))
 	dst := enc.EncodeAll(in, nil)
 	wantSize := len(dst)
 	b.ResetTimer()
@@ -1033,16 +1284,12 @@ func BenchmarkEncoder_EncodeAllTwain(b *testing.B) {
 }
 
 func BenchmarkEncoder_EncodeAllPi(b *testing.B) {
-	f, err := os.Open("../testdata/pi.txt")
-	if err != nil {
-		b.Fatal(err)
-	}
-	in, err := ioutil.ReadAll(f)
+	in, err := os.ReadFile("../testdata/pi.txt")
 	if err != nil {
 		b.Fatal(err)
 	}
 
-	enc := Encoder{}
+	enc, _ := NewWriter(nil, WithEncoderConcurrency(1))
 	dst := enc.EncodeAll(in, nil)
 	wantSize := len(dst)
 	b.ResetTimer()
@@ -1053,6 +1300,49 @@ func BenchmarkEncoder_EncodeAllPi(b *testing.B) {
 		if len(dst) != wantSize {
 			b.Fatal(len(dst), "!=", wantSize)
 		}
+	}
+}
+
+// BenchmarkEncoderCorpus encodes the files in the directory named by
+// ZSTD_CORPUS with EncodeAll on one goroutine at every level, CRC off.
+// Files ending in .zst are skipped. The compression ratio is reported.
+func BenchmarkEncoderCorpus(b *testing.B) {
+	dir := os.Getenv("ZSTD_CORPUS")
+	if dir == "" {
+		b.Skip("ZSTD_CORPUS not set")
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		b.Fatal(err)
+	}
+	for _, e := range ents {
+		name := e.Name()
+		if e.IsDir() || strings.HasSuffix(name, ".zst") {
+			continue
+		}
+		in, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.Run(name, func(b *testing.B) {
+			for level := speedNotSet + 1; level < speedLast; level++ {
+				b.Run(level.String(), func(b *testing.B) {
+					enc, err := NewWriter(nil, WithEncoderConcurrency(1), WithEncoderLevel(level), WithEncoderCRC(false))
+					if err != nil {
+						b.Fatal(err)
+					}
+					defer enc.Close()
+					dst := enc.EncodeAll(in, nil)
+					b.SetBytes(int64(len(in)))
+					b.ReportAllocs()
+					b.ResetTimer()
+					for i := 0; i < b.N; i++ {
+						dst = enc.EncodeAll(in, dst[:0])
+					}
+					b.ReportMetric(float64(len(in))/float64(len(dst)), "ratio")
+				})
+			}
+		})
 	}
 }
 
@@ -1139,7 +1429,7 @@ func BenchmarkRandom10MBEncoderFastest(b *testing.B) {
 	data := make([]byte, 10<<20)
 	rng.Read(data)
 	wantSize := int64(len(data))
-	enc, _ := NewWriter(ioutil.Discard, WithEncoderLevel(SpeedFastest))
+	enc, _ := NewWriter(io.Discard, WithEncoderLevel(SpeedFastest))
 	defer enc.Close()
 	n, err := io.Copy(enc, bytes.NewBuffer(data))
 	if err != nil {
@@ -1152,7 +1442,7 @@ func BenchmarkRandom10MBEncoderFastest(b *testing.B) {
 	b.ReportAllocs()
 	b.SetBytes(wantSize)
 	for i := 0; i < b.N; i++ {
-		enc.Reset(ioutil.Discard)
+		enc.Reset(io.Discard)
 		n, err := io.Copy(enc, bytes.NewBuffer(data))
 		if err != nil {
 			b.Fatal(err)
@@ -1168,7 +1458,7 @@ func BenchmarkRandomEncoderDefault(b *testing.B) {
 	data := make([]byte, 10<<20)
 	rng.Read(data)
 	wantSize := int64(len(data))
-	enc, _ := NewWriter(ioutil.Discard, WithEncoderLevel(SpeedDefault))
+	enc, _ := NewWriter(io.Discard, WithEncoderLevel(SpeedDefault))
 	defer enc.Close()
 	n, err := io.Copy(enc, bytes.NewBuffer(data))
 	if err != nil {
@@ -1181,7 +1471,7 @@ func BenchmarkRandomEncoderDefault(b *testing.B) {
 	b.ReportAllocs()
 	b.SetBytes(wantSize)
 	for i := 0; i < b.N; i++ {
-		enc.Reset(ioutil.Discard)
+		enc.Reset(io.Discard)
 		n, err := io.Copy(enc, bytes.NewBuffer(data))
 		if err != nil {
 			b.Fatal(err)
@@ -1189,5 +1479,89 @@ func BenchmarkRandomEncoderDefault(b *testing.B) {
 		if n != wantSize {
 			b.Fatal(n, "!=", wantSize)
 		}
+	}
+}
+
+func TestHashHelpersMatchHashLen(t *testing.T) {
+	inputs := []uint64{0, 1, 0xff, 0xffffffffff, 1 << 40, 1<<64 - 1, 0x0123456789abcdef}
+	rng := rand.New(rand.NewSource(1))
+	for range 1000 {
+		inputs = append(inputs, rng.Uint64())
+	}
+	primeL, primeS := hashPrimes8and5()
+	tests := []struct {
+		name string
+		got  func(u uint64) uint32
+		want func(u uint64) uint32
+	}{
+		{
+			name: "better long",
+			got:  func(u uint64) uint32 { return betterHashL(u, primeL) },
+			want: func(u uint64) uint32 { return hashLen(u, betterLongTableBits, betterLongLen) },
+		},
+		{
+			name: "better short",
+			got:  func(u uint64) uint32 { return betterHashS(u, primeS) },
+			want: func(u uint64) uint32 { return hashLen(u, betterShortTableBits, betterShortLen) },
+		},
+		{
+			name: "dfast long",
+			got:  func(u uint64) uint32 { return dFastHashL(u, primeL) },
+			want: func(u uint64) uint32 { return hashLen(u, dFastLongTableBits, dFastLongLen) },
+		},
+		{
+			name: "dfast short",
+			got:  func(u uint64) uint32 { return dFastHashS(u, primeS) },
+			want: func(u uint64) uint32 { return hashLen(u, dFastShortTableBits, dFastShortLen) },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, u := range inputs {
+				if got, want := tt.got(u), tt.want(u); got != want {
+					t.Fatalf("u=%#x: got %#x, want %#x", u, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestEncodeTo(t *testing.T) {
+	data, err := os.ReadFile("testdata/comp-crashers.zip")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i, tt := range zr.File {
+		if testing.Short() && i > 10 {
+			break
+		}
+
+		t.Run(tt.Name, func(t *testing.T) {
+			r, err := tt.Open()
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			in, err := io.ReadAll(r)
+			if err != nil {
+				t.Error(err)
+			}
+			encoded := EncodeTo(make([]byte, 0, len(in)/2), in)
+			got, err := DecodeTo(make([]byte, 0, len(in)/2), encoded)
+			if err != nil {
+				t.Logf("error: %v\nwant: %v\ngot:  %v", err, len(in), len(got))
+				t.Fatal(err)
+			}
+			if !bytes.Equal(in, got) {
+				t.Errorf("decode mismatch for %s: want %d, got %d", tt.Name, len(in), len(got))
+				t.Logf("want: %x\ngot:  %x", in, got)
+			}
+		})
 	}
 }

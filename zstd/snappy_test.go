@@ -3,7 +3,6 @@ package zstd
 import (
 	"bytes"
 	"io"
-	"io/ioutil"
 	"os"
 	"testing"
 
@@ -11,7 +10,7 @@ import (
 )
 
 func TestSnappy_ConvertSimple(t *testing.T) {
-	in, err := ioutil.ReadFile("testdata/z000028")
+	in, err := os.ReadFile("testdata/z000028")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +47,7 @@ func TestSnappy_ConvertSimple(t *testing.T) {
 		t.Error(err, len(decoded))
 	}
 	if !bytes.Equal(decoded, in) {
-		ioutil.WriteFile("testdata/z000028.got", decoded, os.ModePerm)
+		os.WriteFile("testdata/z000028.got", decoded, os.ModePerm)
 		t.Fatal("Decoded does not match")
 	}
 	t.Log("Encoded content matched")
@@ -59,12 +58,14 @@ func TestSnappy_ConvertXML(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer f.Close()
+
 	dec, err := NewReader(f)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dec.Close()
-	in, err := ioutil.ReadAll(dec)
+	in, err := io.ReadAll(dec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +96,7 @@ func TestSnappy_ConvertXML(t *testing.T) {
 		t.Error(err, len(decoded))
 	}
 	if !bytes.Equal(decoded, in) {
-		ioutil.WriteFile("testdata/xml.got", decoded, os.ModePerm)
+		os.WriteFile("testdata/xml.got", decoded, os.ModePerm)
 		t.Fatal("Decoded does not match")
 	}
 	t.Log("Encoded content matched")
@@ -105,7 +106,7 @@ func TestSnappy_ConvertSilesia(t *testing.T) {
 	if testing.Short() {
 		t.SkipNow()
 	}
-	in, err := ioutil.ReadFile("testdata/silesia.tar")
+	in, err := os.ReadFile("testdata/silesia.tar")
 	if err != nil {
 		if os.IsNotExist(err) {
 			t.Skip("Missing testdata/silesia.tar")
@@ -146,7 +147,7 @@ func TestSnappy_ConvertSilesia(t *testing.T) {
 		t.Error(err, len(decoded))
 	}
 	if !bytes.Equal(decoded, in) {
-		ioutil.WriteFile("testdata/silesia.tar.got", decoded, os.ModePerm)
+		os.WriteFile("testdata/silesia.tar.got", decoded, os.ModePerm)
 		t.Fatal("Decoded does not match")
 	}
 	t.Log("Encoded content matched")
@@ -164,12 +165,14 @@ func TestSnappy_ConvertEnwik9(t *testing.T) {
 				"compress it with 'zstd -15 -T0 enwik9' and place it in " + file)
 		}
 	}
+	defer f.Close()
+
 	dec, err := NewReader(f)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dec.Close()
-	in, err := ioutil.ReadAll(dec)
+	in, err := io.ReadAll(dec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,10 +204,50 @@ func TestSnappy_ConvertEnwik9(t *testing.T) {
 		t.Error(err, len(decoded))
 	}
 	if !bytes.Equal(decoded, in) {
-		ioutil.WriteFile("testdata/enwik9.got", decoded, os.ModePerm)
+		os.WriteFile("testdata/enwik9.got", decoded, os.ModePerm)
 		t.Fatal("Decoded does not match")
 	}
 	t.Log("Encoded content matched")
+}
+
+// TestSnappy_ConvertMalformedLiteralStale verifies that a malformed compressed
+// chunk declaring a literal longer than the bytes present in the chunk is
+// rejected as corrupt, instead of reading stale bytes from the reused r.buf.
+func TestSnappy_ConvertMalformedLiteralStale(t *testing.T) {
+	framedCompressedBlock := func(payload []byte) []byte {
+		stream := []byte{0xff, 0x06, 0x00, 0x00, 's', 'N', 'a', 'P', 'p', 'Y'}
+		chunkLen := snappyChecksumSize + len(payload)
+		stream = append(stream, 0x00, byte(chunkLen), byte(chunkLen>>8), byte(chunkLen>>16))
+		stream = append(stream, 0x00, 0x00, 0x00, 0x00) // checksum, not verified for compressed chunks
+		return append(stream, payload...)
+	}
+	convert := func(conv *SnappyConverter, stream []byte) ([]byte, error) {
+		var comp bytes.Buffer
+		if _, err := conv.Convert(bytes.NewReader(stream), &comp); err != nil && err != io.EOF {
+			return nil, err
+		}
+		dec, err := NewReader(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer dec.Close()
+		return dec.DecodeAll(comp.Bytes(), nil)
+	}
+
+	var conv SnappyConverter
+
+	// Valid block: decoded length 4, 4-byte literal "PREV".
+	first := []byte{0x04, 0x0c, 'P', 'R', 'E', 'V'}
+	if _, err := convert(&conv, framedCompressedBlock(first)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Malformed block: declares a 4-byte literal but supplies none.
+	// Must be rejected instead of returning "PREV" from the reused buffer.
+	malformed := []byte{0x04, 0x0c}
+	if _, err := convert(&conv, framedCompressedBlock(malformed)); err != ErrSnappyCorrupt {
+		t.Fatalf("expected ErrSnappyCorrupt, got %v", err)
+	}
 }
 
 func BenchmarkSnappy_ConvertXML(b *testing.B) {
@@ -212,12 +255,14 @@ func BenchmarkSnappy_ConvertXML(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
+	defer f.Close()
+
 	dec, err := NewReader(f)
 	if err != nil {
 		b.Fatal(err)
 	}
 	defer dec.Close()
-	in, err := ioutil.ReadAll(dec)
+	in, err := io.ReadAll(dec)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -234,7 +279,7 @@ func BenchmarkSnappy_ConvertXML(b *testing.B) {
 	}
 	s := SnappyConverter{}
 	compBytes := comp.Bytes()
-	_, err = s.Convert(&comp, ioutil.Discard)
+	_, err = s.Convert(&comp, io.Discard)
 	if err != io.EOF {
 		b.Fatal(err)
 	}
@@ -242,7 +287,7 @@ func BenchmarkSnappy_ConvertXML(b *testing.B) {
 	b.ReportAllocs()
 	b.SetBytes(int64(len(in)))
 	for i := 0; i < b.N; i++ {
-		_, err := s.Convert(bytes.NewBuffer(compBytes), ioutil.Discard)
+		_, err := s.Convert(bytes.NewBuffer(compBytes), io.Discard)
 		if err != io.EOF {
 			b.Fatal(err)
 		}
@@ -255,12 +300,14 @@ func BenchmarkSnappy_Enwik9(b *testing.B) {
 		b.Skip(err)
 		return
 	}
+	defer f.Close()
+
 	dec, err := NewReader(f)
 	if err != nil {
 		b.Fatal(err)
 	}
 	defer dec.Close()
-	in, err := ioutil.ReadAll(dec)
+	in, err := io.ReadAll(dec)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -278,7 +325,7 @@ func BenchmarkSnappy_Enwik9(b *testing.B) {
 	}
 	s := SnappyConverter{}
 	compBytes := comp.Bytes()
-	_, err = s.Convert(&comp, ioutil.Discard)
+	_, err = s.Convert(&comp, io.Discard)
 	if err != io.EOF {
 		b.Fatal(err)
 	}
@@ -286,7 +333,7 @@ func BenchmarkSnappy_Enwik9(b *testing.B) {
 	b.ReportAllocs()
 	b.SetBytes(int64(len(in)))
 	for i := 0; i < b.N; i++ {
-		_, err := s.Convert(bytes.NewBuffer(compBytes), ioutil.Discard)
+		_, err := s.Convert(bytes.NewBuffer(compBytes), io.Discard)
 		if err != io.EOF {
 			b.Fatal(err)
 		}
@@ -294,7 +341,7 @@ func BenchmarkSnappy_Enwik9(b *testing.B) {
 }
 
 func BenchmarkSnappy_ConvertSilesia(b *testing.B) {
-	in, err := ioutil.ReadFile("testdata/silesia.tar")
+	in, err := os.ReadFile("testdata/silesia.tar")
 	if err != nil {
 		if os.IsNotExist(err) {
 			b.Skip("Missing testdata/silesia.tar")
@@ -315,7 +362,7 @@ func BenchmarkSnappy_ConvertSilesia(b *testing.B) {
 	}
 	s := SnappyConverter{}
 	compBytes := comp.Bytes()
-	_, err = s.Convert(&comp, ioutil.Discard)
+	_, err = s.Convert(&comp, io.Discard)
 	if err != io.EOF {
 		b.Fatal(err)
 	}
@@ -323,9 +370,49 @@ func BenchmarkSnappy_ConvertSilesia(b *testing.B) {
 	b.ReportAllocs()
 	b.SetBytes(int64(len(in)))
 	for i := 0; i < b.N; i++ {
-		_, err := s.Convert(bytes.NewBuffer(compBytes), ioutil.Discard)
+		_, err := s.Convert(bytes.NewBuffer(compBytes), io.Discard)
 		if err != io.EOF {
 			b.Fatal(err)
 		}
+	}
+}
+
+// TestSnappy_ConvertShortCopy checks that a Snappy stream containing a copy
+// shorter than the zstd minimum match is rejected instead of panicking.
+// Such a copy makes matchLen underflow and produces an out-of-range match
+// length code during sequence encoding.
+func TestSnappy_ConvertShortCopy(t *testing.T) {
+	build := func(ops []byte, decoded int) []byte {
+		in := []byte{0xff, 0x06, 0x00, 0x00}
+		in = append(in, []byte("sNaPpY")...)
+		chunk := []byte{0, 0, 0, 0} // CRC, not verified for compressed chunks
+		v := uint64(decoded)
+		for v >= 0x80 {
+			chunk = append(chunk, byte(v)|0x80)
+			v >>= 7
+		}
+		chunk = append(chunk, byte(v))
+		chunk = append(chunk, ops...)
+		l := len(chunk)
+		in = append(in, 0x00, byte(l), byte(l>>8), byte(l>>16))
+		return append(in, chunk...)
+	}
+
+	// A literal run followed by enough long copies to make the sequence
+	// encoder pick the FSE path, then a length-1 Copy2 (offset 1).
+	ops := []byte{0x0C, 0x41, 0x41, 0x41, 0x41}
+	decoded := 4
+	for range 6 {
+		ops = append(ops, 0xFE, 0x01, 0x00) // Copy2 length 64, offset 1
+		decoded += 64
+	}
+	ops = append(ops, 0x02, 0x01, 0x00) // Copy2 length 1, offset 1
+	decoded++
+
+	var s SnappyConverter
+	var dst bytes.Buffer
+	_, err := s.Convert(bytes.NewReader(build(ops, decoded)), &dst)
+	if err != ErrSnappyCorrupt {
+		t.Fatalf("want ErrSnappyCorrupt, got %v", err)
 	}
 }

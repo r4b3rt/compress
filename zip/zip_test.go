@@ -12,7 +12,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
-	"io/ioutil"
+	"math/bits"
 	"runtime"
 	"sort"
 	"strings"
@@ -24,13 +24,13 @@ func TestOver65kFiles(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping in short mode")
 	}
-	buf := new(bytes.Buffer)
+	buf := new(strings.Builder)
 	w := NewWriter(buf)
 	const nFiles = (1 << 16) + 42
-	for i := 0; i < nFiles; i++ {
+	for i := range nFiles {
 		_, err := w.CreateHeader(&FileHeader{
 			Name:   fmt.Sprintf("%d.dat", i),
-			Method: Store, // avoid Issue 6136 and Issue 6138
+			Method: Store, // Deflate is too slow when it is compiled with -race flag
 		})
 		if err != nil {
 			t.Fatalf("creating file %d: %v", i, err)
@@ -47,7 +47,7 @@ func TestOver65kFiles(t *testing.T) {
 	if got := len(zr.File); got != nFiles {
 		t.Fatalf("File contains %d files, want %d", got, nFiles)
 	}
-	for i := 0; i < nFiles; i++ {
+	for i := range nFiles {
 		want := fmt.Sprintf("%d.dat", i)
 		if zr.File[i].Name != want {
 			t.Fatalf("File(%d) = %q, want %q", i, zr.File[i].Name, want)
@@ -196,13 +196,6 @@ func (r *rleBuffer) Write(p []byte) (n int, err error) {
 		}
 	}
 	return len(p), nil
-}
-
-func min(x, y int64) int64 {
-	if x < y {
-		return x
-	}
-	return y
 }
 
 func memset(a []byte, b byte) {
@@ -358,7 +351,7 @@ func TestZip64ManyRecords(t *testing.T) {
 	t.Parallel()
 	gen := func(numRec int) func(*Writer) {
 		return func(w *Writer) {
-			for i := 0; i < numRec; i++ {
+			for range numRec {
 				_, err := w.CreateHeader(&FileHeader{
 					Name:   "a.txt",
 					Method: Store,
@@ -430,10 +423,7 @@ func (ss *suffixSaver) Write(p []byte) (n int, err error) {
 	ss.size += int64(len(p))
 	if len(ss.buf) < ss.keep {
 		space := ss.keep - len(ss.buf)
-		add := len(p)
-		if add > space {
-			add = space
-		}
+		add := min(len(p), space)
 		ss.buf = append(ss.buf, p[:add]...)
 		p = p[add:]
 	}
@@ -507,6 +497,9 @@ func TestZip64LargeDirectory(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping in short mode")
 	}
+	if bits.UintSize == 32 {
+		t.Skip("skipping on 32-bit platforms")
+	}
 	t.Parallel()
 	// gen returns a func that writes a zip with a wantLen bytes
 	// of central directory.
@@ -543,16 +536,32 @@ func TestZip64LargeDirectory(t *testing.T) {
 			}
 		}
 	}
+	// Each NewReader below holds about 8 GiB of directory, so the
+	// subtests run one at a time, with a GC in between.
 	t.Run("uint32max-1_NoZip64", func(t *testing.T) {
-		t.Parallel()
-		if generatesZip64(t, gen(uint32max-1)) {
+		buf := new(rleBuffer)
+		w := NewWriter(buf)
+		gen(uint32max - 1)(w)
+		if suffixIsZip64(t, buf) {
 			t.Error("unexpected zip64")
 		}
+		if _, err := NewReader(buf, buf.Size()); err != nil {
+			t.Errorf("NewReader: %v", err)
+		}
 	})
+	runtime.GC()
 	t.Run("uint32max_HasZip64", func(t *testing.T) {
-		t.Parallel()
-		if !generatesZip64(t, gen(uint32max)) {
+		buf := new(rleBuffer)
+		w := NewWriter(buf)
+		gen(uint32max)(w)
+		if !suffixIsZip64(t, buf) {
 			t.Error("expected zip64")
+		}
+		// Round-trip through NewReader. With CD size exactly 0xFFFFFFFF,
+		// records well below 0xFFFF, and dirOffset == 0, the only EOCD
+		// field that holds the placeholder is directorySize.
+		if _, err := NewReader(buf, buf.Size()); err != nil {
+			t.Errorf("NewReader: %v", err)
 		}
 	})
 }
@@ -575,7 +584,7 @@ func testZip64(t testing.TB, size int64) *rleBuffer {
 	for i := range chunk {
 		chunk[i] = '.'
 	}
-	for i := 0; i < chunks; i++ {
+	for range chunks {
 		_, err := f.Write(chunk)
 		if err != nil {
 			t.Fatal("write chunk:", err)
@@ -607,7 +616,7 @@ func testZip64(t testing.TB, size int64) *rleBuffer {
 		t.Fatal("opening:", err)
 	}
 	rc.(*checksumReader).hash = fakeHash32{}
-	for i := 0; i < chunks; i++ {
+	for range chunks {
 		_, err := io.ReadFull(rc, chunk)
 		if err != nil {
 			t.Fatal("read:", err)
@@ -619,7 +628,7 @@ func testZip64(t testing.TB, size int64) *rleBuffer {
 			t.Fatal("read:", err)
 		}
 	}
-	gotEnd, err := ioutil.ReadAll(rc)
+	gotEnd, err := io.ReadAll(rc)
 	if err != nil {
 		t.Fatal("read end:", err)
 	}
@@ -706,6 +715,7 @@ func TestHeaderTooLongErr(t *testing.T) {
 	var headerTests = []struct {
 		name    string
 		extra   []byte
+		size    uint64 // if non-zero, use CreateRaw with this uncompressed size
 		wanterr error
 	}{
 		{
@@ -716,6 +726,14 @@ func TestHeaderTooLongErr(t *testing.T) {
 		{
 			name:    "long_extra",
 			extra:   bytes.Repeat([]byte{0xff}, 1<<16),
+			wanterr: errLongExtra,
+		},
+		{
+			// Fits on its own, but not with the 20-byte Zip64 extra
+			// that CreateRaw adds to the local header.
+			name:    "long_extra_zip64",
+			extra:   bytes.Repeat([]byte{0xff}, uint16max-10),
+			size:    5 << 30,
 			wanterr: errLongExtra,
 		},
 	}
@@ -729,7 +747,13 @@ func TestHeaderTooLongErr(t *testing.T) {
 			Name:  test.name,
 			Extra: test.extra,
 		}
-		_, err := w.CreateHeader(h)
+		var err error
+		if test.size > 0 {
+			h.UncompressedSize64 = test.size
+			_, err = w.CreateRaw(h)
+		} else {
+			_, err = w.CreateHeader(h)
+		}
 		if err != test.wanterr {
 			t.Errorf("error=%v, want %v", err, test.wanterr)
 		}

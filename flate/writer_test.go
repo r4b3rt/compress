@@ -10,13 +10,15 @@ import (
 	"compress/flate"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"math/rand"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/klauspost/compress/internal/silesiatest"
 )
 
 func TestWriterMemUsage(t *testing.T) {
@@ -30,9 +32,9 @@ func TestWriterMemUsage(t *testing.T) {
 		t.Logf("%s: Memory Used: %dKB, %d allocs", t.Name(), (after.HeapInuse-before.HeapInuse)/1024, after.HeapObjects-before.HeapObjects)
 	}
 	data := make([]byte, 100000)
-	t.Run(fmt.Sprint("stateless"), func(t *testing.T) {
+	t.Run("stateless", func(t *testing.T) {
 		testMem(t, func() {
-			StatelessDeflate(ioutil.Discard, data, false, nil)
+			StatelessDeflate(io.Discard, data, false, nil)
 		})
 	})
 	for level := HuffmanOnly; level <= BestCompression; level++ {
@@ -40,7 +42,7 @@ func TestWriterMemUsage(t *testing.T) {
 			var zr *Writer
 			var err error
 			testMem(t, func() {
-				zr, err = NewWriter(ioutil.Discard, level)
+				zr, err = NewWriter(io.Discard, level)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -54,7 +56,7 @@ func TestWriterMemUsage(t *testing.T) {
 			var zr *flate.Writer
 			var err error
 			testMem(t, func() {
-				zr, err = flate.NewWriter(ioutil.Discard, level)
+				zr, err = flate.NewWriter(io.Discard, level)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -66,7 +68,7 @@ func TestWriterMemUsage(t *testing.T) {
 }
 
 func TestWriterRegression(t *testing.T) {
-	data, err := ioutil.ReadFile("testdata/regression.zip")
+	data, err := os.ReadFile("testdata/regression.zip")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +93,7 @@ func TestWriterRegression(t *testing.T) {
 						t.Error(err)
 						return
 					}
-					in, err := ioutil.ReadAll(r)
+					in, err := io.ReadAll(r)
 					if err != nil {
 						t.Error(err)
 					}
@@ -113,7 +115,7 @@ func TestWriterRegression(t *testing.T) {
 						t.Fatal(msg + err.Error())
 					}
 					fr1 := NewReader(buf)
-					data2, err := ioutil.ReadAll(fr1)
+					data2, err := io.ReadAll(fr1)
 					if err != nil {
 						t.Fatal(msg + err.Error())
 					}
@@ -136,7 +138,7 @@ func TestWriterRegression(t *testing.T) {
 						t.Fatal(msg + err.Error())
 					}
 					fr1 = NewReader(buf)
-					data2, err = ioutil.ReadAll(fr1)
+					data2, err = io.ReadAll(fr1)
 					if err != nil {
 						t.Fatal(msg + err.Error())
 					}
@@ -151,7 +153,7 @@ func TestWriterRegression(t *testing.T) {
 
 func benchmarkEncoder(b *testing.B, testfile, level, n int) {
 	b.SetBytes(int64(n))
-	buf0, err := ioutil.ReadFile(testfiles[testfile])
+	buf0, err := os.ReadFile(testfiles[testfile])
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -167,14 +169,14 @@ func benchmarkEncoder(b *testing.B, testfile, level, n int) {
 	}
 	buf0 = nil
 	runtime.GC()
-	w, err := NewWriter(ioutil.Discard, level)
+	w, err := NewWriter(io.Discard, level)
 	if err != nil {
 		b.Fatal(err)
 	}
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		w.Reset(ioutil.Discard)
+		w.Reset(io.Discard)
 		_, err = w.Write(buf1)
 		if err != nil {
 			b.Fatal(err)
@@ -217,9 +219,13 @@ func BenchmarkEncodeTwainSL1e4(b *testing.B)        { benchmarkStatelessEncoder(
 func BenchmarkEncodeTwainSL1e5(b *testing.B)        { benchmarkStatelessEncoder(b, twain, 1e5) }
 func BenchmarkEncodeTwainSL1e6(b *testing.B)        { benchmarkStatelessEncoder(b, twain, 1e6) }
 
+func BenchmarkEncodeTwain1024Win1e4(b *testing.B) { benchmarkEncoder(b, twain, oneK, 1e4) }
+func BenchmarkEncodeTwain1024Win1e5(b *testing.B) { benchmarkEncoder(b, twain, oneK, 1e5) }
+func BenchmarkEncodeTwain1024Win1e6(b *testing.B) { benchmarkEncoder(b, twain, oneK, 1e6) }
+
 func benchmarkStatelessEncoder(b *testing.B, testfile, n int) {
 	b.SetBytes(int64(n))
-	buf0, err := ioutil.ReadFile(testfiles[testfile])
+	buf0, err := os.ReadFile(testfiles[testfile])
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -238,7 +244,7 @@ func benchmarkStatelessEncoder(b *testing.B, testfile, n int) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		w := NewStatelessWriter(ioutil.Discard)
+		w := NewStatelessWriter(io.Discard)
 		_, err = w.Write(buf1)
 		if err != nil {
 			b.Fatal(err)
@@ -276,7 +282,7 @@ func TestWriteError(t *testing.T) {
 	in := buf.Bytes()
 	// We create our own buffer to control number of writes.
 	copyBuf := make([]byte, 128)
-	for l := 0; l < 10; l++ {
+	for l := range 10 {
 		for fail := 1; fail <= 256; fail *= 2 {
 			// Fail after 'fail' writes
 			ew := &errorWriter{N: fail}
@@ -284,7 +290,7 @@ func TestWriteError(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewWriter: level %d: %v", l, err)
 			}
-			n, err := copyBuffer(w, bytes.NewBuffer(in), copyBuf)
+			n, err := io.CopyBuffer(struct{ io.Writer }{w}, struct{ io.Reader }{bytes.NewBuffer(in)}, copyBuf)
 			if err == nil {
 				t.Fatalf("Level %d: Expected an error, writer was %#v", l, ew)
 			}
@@ -304,7 +310,7 @@ func TestWriteError(t *testing.T) {
 				t.Fatal("Level", l, "Expected an error on close")
 			}
 
-			w.Reset(ioutil.Discard)
+			w.Reset(io.Discard)
 			n2, err = w.Write([]byte{1, 2, 3, 4, 5, 6})
 			if err != nil {
 				t.Fatal("Level", l, "Got unexpected error after reset:", err)
@@ -330,8 +336,7 @@ func TestWriter_Reset(t *testing.T) {
 		fmt.Fprintf(buf, "asdasfasf%d%dfghfgujyut%dyutyu\n", i, i, i)
 	}
 	in := buf.Bytes()
-	for l := 0; l < 10; l++ {
-		l := l
+	for l := range 10 {
 		if testing.Short() && l > 1 {
 			continue
 		}
@@ -343,7 +348,7 @@ func TestWriter_Reset(t *testing.T) {
 			}
 			for ; offset <= 256; offset *= 2 {
 				// Fail after 'fail' writes
-				w, err := NewWriter(ioutil.Discard, l)
+				w, err := NewWriter(io.Discard, l)
 				if err != nil {
 					t.Fatalf("NewWriter: level %d: %v", l, err)
 				}
@@ -360,7 +365,7 @@ func TestWriter_Reset(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				for i := 0; i < 50; i++ {
+				for range 50 {
 					// skip ahead again... This should wrap around...
 					w.d.fast.Reset()
 				}
@@ -370,7 +375,7 @@ func TestWriter_Reset(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				for i := 0; i < (math.MaxUint32-bufferReset)/maxMatchOffset; i++ {
+				for range (math.MaxUint32 - bufferReset) / maxMatchOffset {
 					// skip ahead to where we are close to wrap around...
 					w.d.fast.Reset()
 				}
@@ -423,7 +428,7 @@ func testDeterministic(i int, t *testing.T) {
 	}
 	// Use a very small prime sized buffer.
 	cbuf := make([]byte, 787)
-	_, err = copyBuffer(w, br, cbuf)
+	_, err = io.CopyBuffer(struct{ io.Writer }{w}, struct{ io.Reader }{br}, cbuf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -438,7 +443,7 @@ func testDeterministic(i int, t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = copyBuffer(w2, br2, cbuf)
+	_, err = io.CopyBuffer(struct{ io.Writer }{w2}, struct{ io.Reader }{br2}, cbuf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -470,35 +475,205 @@ func testDeterministic(i int, t *testing.T) {
 	}
 }
 
-// copyBuffer is a copy of io.CopyBuffer, since we want to support older go versions.
-// This is modified to never use io.WriterTo or io.ReaderFrom interfaces.
-func copyBuffer(dst io.Writer, src io.Reader, buf []byte) (written int64, err error) {
-	if buf == nil {
-		buf = make([]byte, 32*1024)
+func BenchmarkCompressAllocations(b *testing.B) {
+	payload := []byte(strings.Repeat("Tiny payload", 20))
+	for j := -2; j <= 9; j++ {
+		b.Run("level("+strconv.Itoa(j)+")", func(b *testing.B) {
+			b.Run("flate", func(b *testing.B) {
+				b.ReportAllocs()
+
+				for i := 0; i < b.N; i++ {
+					w, err := NewWriter(io.Discard, j)
+					if err != nil {
+						b.Fatal(err)
+					}
+					w.Write(payload)
+					w.Close()
+				}
+			})
+		})
 	}
-	for {
-		nr, er := src.Read(buf)
-		if nr > 0 {
-			nw, ew := dst.Write(buf[0:nr])
-			if nw > 0 {
-				written += int64(nw)
+}
+
+func BenchmarkCompressAllocationsSingle(b *testing.B) {
+	payload := []byte(strings.Repeat("Tiny payload", 20))
+	const level = 2
+	b.Run("flate", func(b *testing.B) {
+		b.ReportAllocs()
+
+		for i := 0; i < b.N; i++ {
+			w, err := NewWriter(io.Discard, level)
+			if err != nil {
+				b.Fatal(err)
 			}
-			if ew != nil {
-				err = ew
-				break
-			}
-			if nr != nw {
-				err = io.ErrShortWrite
-				break
-			}
+			w.Write(payload)
+			w.Close()
 		}
-		if er == io.EOF {
-			break
+	})
+}
+
+// TestNonCompressedBlockDoesntAddDict checks that the dictionary isn't sent when
+// sending a non-compressed block. See https://go.dev/issue/80538
+func TestNonCompressedBlockDoesntAddDict(t *testing.T) {
+	data := make([]byte, 763)
+	rand.New(rand.NewSource(42)).Read(data)
+	dict := []byte("0123456789abcdefghij")
+	for l := HuffmanOnly; l <= BestCompression; l++ {
+		t.Run(fmt.Sprintf("level=%d", l), func(t *testing.T) {
+			var b bytes.Buffer
+			w, err := NewWriterDict(&b, l, dict)
+			if err != nil {
+				t.Fatalf("NewWriterDict: %v", err)
+			}
+			if _, err := w.Write(data); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+			got, err := io.ReadAll(NewReaderDict(&b, dict))
+			if err != nil {
+				t.Fatalf("NewReaderDict: %v", err)
+			}
+			if !bytes.Equal(got, data) {
+				t.Errorf("round trip mismatch: got %d bytes, want %d (dictionary emitted: %v)",
+					len(got), len(data), bytes.HasPrefix(got, dict))
+			}
+			if b.Len() != 0 {
+				t.Errorf("compressed stream not fully consumed: %d bytes left", b.Len())
+			}
+		})
+	}
+}
+
+// TestSilesiaRoundTrip round-trips the Silesia corpus through Writer and
+// Reader at each level, decoding each result with the standard library too,
+// and decodes the standard library's encoding.
+func TestSilesiaRoundTrip(t *testing.T) {
+	in := silesiatest.Tar(t)
+	check := func(t *testing.T, r io.Reader) {
+		t.Helper()
+		got, err := io.ReadAll(r)
+		if err != nil {
+			t.Fatal(err)
 		}
-		if er != nil {
-			err = er
-			break
+		if !bytes.Equal(got, in) {
+			t.Fatal("output differs from input")
 		}
 	}
-	return written, err
+	for level := HuffmanOnly; level <= BestCompression; level++ {
+		t.Run(fmt.Sprint("level", level), func(t *testing.T) {
+			var buf bytes.Buffer
+			w, err := NewWriter(&buf, level)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.Copy(w, bytes.NewReader(in)); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+			check(t, NewReader(bytes.NewReader(buf.Bytes())))
+			check(t, flate.NewReader(bytes.NewReader(buf.Bytes())))
+		})
+	}
+	t.Run("stdlib-encoded", func(t *testing.T) {
+		var buf bytes.Buffer
+		w, err := flate.NewWriter(&buf, flate.DefaultCompression)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write(in); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		check(t, NewReader(&buf))
+	})
+}
+
+type canGetFastGen interface {
+	getFastGen() *fastGen
+}
+
+func (f *fastGen) getFastGen() *fastGen { return f }
+
+// TestDeflateFastFlush_Reset tests that blocks too small to be compressed,
+// which are only added to the match history, keep encoding correct and
+// consistent across a wraparound of the table offset.
+// See https://go.dev/issue/81542.
+func TestDeflateFastFlush_Reset(t *testing.T) {
+	buf := new(bytes.Buffer)
+	for i := range 40000 {
+		fmt.Fprintf(buf, "asdfasdfasdf%d\n", i)
+	}
+	in := buf.Bytes()[:420000]
+
+	// Flush blocks too small for the encoder to emit tokens, with an
+	// occasional block big enough to be matched against them.
+	writeAll := func(t *testing.T, w *Writer) {
+		for i, data := 0, in; len(data) > 0; i++ {
+			n := 12
+			if i%64 == 63 {
+				n = 300
+			}
+			n = min(n, len(data))
+			if _, err := w.Write(data[:n]); err != nil {
+				t.Fatal(err)
+			}
+			data = data[n:]
+			if err := w.Flush(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	for level := 1; level <= 6; level++ {
+		t.Run(fmt.Sprintf("level=%d", level), func(t *testing.T) {
+			// We do an encode with a clean buffer to compare.
+			var want bytes.Buffer
+			w, err := NewWriter(&want, level)
+			if err != nil {
+				t.Fatalf("NewWriter: level %d: %v", level, err)
+			}
+			writeAll(t, w)
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+			// Both encodes would agree on a gap in the history, so check that
+			// the output decodes.
+			dec, err := io.ReadAll(NewReader(bytes.NewReader(want.Bytes())))
+			if err != nil || !bytes.Equal(dec, in) {
+				t.Fatalf("roundtrip failed: %v", err)
+			}
+
+			w, err = NewWriter(io.Discard, level)
+			if err != nil {
+				t.Fatalf("NewWriter: level %d: %v", level, err)
+			}
+			// Skip ahead so that appending the blocks below wraps the history
+			// buffer past bufferReset.
+			for range (bufferReset - 250000) / maxMatchOffset {
+				w.d.fast.Reset()
+			}
+			var got bytes.Buffer
+			w.Reset(&got)
+			fg := w.d.fast.(canGetFastGen).getFastGen()
+			before := fg.cur
+			writeAll(t, w)
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			// The offset only ever grows, except when it is rebased.
+			if fg.cur >= before {
+				t.Fatalf("test did not reach the wraparound, offset went %d -> %d", before, fg.cur)
+			}
+			if !bytes.Equal(got.Bytes(), want.Bytes()) {
+				t.Errorf("output did not match at wraparound, len(want) = %d, len(got) = %d", want.Len(), got.Len())
+			}
+		})
+	}
 }

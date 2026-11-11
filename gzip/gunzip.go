@@ -10,6 +10,7 @@ import (
 	"bufio"
 	"compress/gzip"
 	"encoding/binary"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"time"
@@ -106,6 +107,7 @@ func (z *Reader) Reset(r io.Reader) error {
 	*z = Reader{
 		decompressor: z.decompressor,
 		multistream:  true,
+		br:           z.br,
 	}
 	if rr, ok := r.(flate.Reader); ok {
 		z.r = rr
@@ -194,7 +196,11 @@ func (z *Reader) readHeader() (hdr Header, err error) {
 		return hdr, ErrHeader
 	}
 	flg := z.buf[3]
-	hdr.ModTime = time.Unix(int64(le.Uint32(z.buf[4:8])), 0)
+	if t := int64(le.Uint32(z.buf[4:8])); t > 0 {
+		// Section 2.3.1, the zero value for MTIME means that the
+		// modified time is not set.
+		hdr.ModTime = time.Unix(t, 0)
+	}
 	// z.buf[8] is XFL and is currently ignored.
 	hdr.OS = z.buf[9]
 	z.digest = crc32.ChecksumIEEE(z.buf[:10])
@@ -215,14 +221,14 @@ func (z *Reader) readHeader() (hdr Header, err error) {
 	var s string
 	if flg&flagName != 0 {
 		if s, err = z.readString(); err != nil {
-			return hdr, err
+			return hdr, noEOF(err)
 		}
 		hdr.Name = s
 	}
 
 	if flg&flagComment != 0 {
 		if s, err = z.readString(); err != nil {
-			return hdr, err
+			return hdr, noEOF(err)
 		}
 		hdr.Comment = s
 	}
@@ -235,6 +241,11 @@ func (z *Reader) readHeader() (hdr Header, err error) {
 		if digest != uint16(z.digest) {
 			return hdr, ErrHeader
 		}
+	}
+
+	// Reserved FLG bits must be zero.
+	if flg>>5 != 0 {
+		return hdr, ErrHeader
 	}
 
 	z.digest = 0
@@ -252,48 +263,71 @@ func (z *Reader) Read(p []byte) (n int, err error) {
 		return 0, z.err
 	}
 
-	n, z.err = z.decompressor.Read(p)
-	z.digest = crc32.Update(z.digest, crc32.IEEETable, p[:n])
-	z.size += uint32(n)
-	if z.err != io.EOF {
-		// In the normal case we return here.
-		return n, z.err
+	for n == 0 {
+		n, z.err = z.decompressor.Read(p)
+		z.digest = crc32.Update(z.digest, crc32.IEEETable, p[:n])
+		z.size += uint32(n)
+		if z.err != io.EOF {
+			// In the normal case we return here.
+			return n, z.err
+		}
+
+		// Finished file; check checksum and size.
+		if _, err := io.ReadFull(z.r, z.buf[:8]); err != nil {
+			z.err = noEOF(err)
+			return n, z.err
+		}
+		digest := le.Uint32(z.buf[:4])
+		size := le.Uint32(z.buf[4:8])
+		if digest != z.digest || size != z.size {
+			z.err = ErrChecksum
+			return n, z.err
+		}
+		z.digest, z.size = 0, 0
+
+		// File is ok; check if there is another.
+		if !z.multistream {
+			return n, io.EOF
+		}
+		z.err = nil // Remove io.EOF
+
+		if _, z.err = z.readHeader(); z.err != nil {
+			return n, z.err
+		}
 	}
 
-	// Finished file; check checksum and size.
-	if _, err := io.ReadFull(z.r, z.buf[:8]); err != nil {
-		z.err = noEOF(err)
-		return n, z.err
-	}
-	digest := le.Uint32(z.buf[:4])
-	size := le.Uint32(z.buf[4:8])
-	if digest != z.digest || size != z.size {
-		z.err = ErrChecksum
-		return n, z.err
-	}
-	z.digest, z.size = 0, 0
-
-	// File is ok; check if there is another.
-	if !z.multistream {
-		return n, io.EOF
-	}
-	z.err = nil // Remove io.EOF
-
-	if _, z.err = z.readHeader(); z.err != nil {
-		return n, z.err
-	}
-
-	// Read from next file, if necessary.
-	if n > 0 {
-		return n, nil
-	}
-	return z.Read(p)
+	return n, nil
 }
 
-// Support the io.WriteTo interface for io.Copy and friends.
+type crcer interface {
+	io.Writer
+	Sum32() uint32
+	Reset()
+}
+type crcUpdater struct {
+	z *Reader
+}
+
+func (c *crcUpdater) Write(p []byte) (int, error) {
+	c.z.digest = crc32.Update(c.z.digest, crc32.IEEETable, p)
+	return len(p), nil
+}
+
+func (c *crcUpdater) Sum32() uint32 {
+	return c.z.digest
+}
+
+func (c *crcUpdater) Reset() {
+	c.z.digest = 0
+}
+
+// WriteTo support the io.WriteTo interface for io.Copy and friends.
 func (z *Reader) WriteTo(w io.Writer) (int64, error) {
 	total := int64(0)
-	crcWriter := crc32.NewIEEE()
+	crcWriter := crcer(crc32.NewIEEE())
+	if z.digest != 0 {
+		crcWriter = &crcUpdater{z: z}
+	}
 	for {
 		if z.err != nil {
 			if z.err == io.EOF {
@@ -308,8 +342,12 @@ func (z *Reader) WriteTo(w io.Writer) (int64, error) {
 		total += n
 		z.size += uint32(n)
 		if err != nil {
-			z.err = err
-			return total, z.err
+			// z.err doubles as the end-of-stream marker. Wrap with %w so a
+			// writer's io.EOF stays identifiable as a write failure and is
+			// not mistaken for a clean end of the input (io.EOF) or reported
+			// to later calls as truncated input (io.ErrUnexpectedEOF).
+			z.err = fmt.Errorf("gzip: %w", err)
+			return total, err
 		}
 
 		// Finished file; check checksum + size.
@@ -331,6 +369,10 @@ func (z *Reader) WriteTo(w io.Writer) (int64, error) {
 
 		// File is ok; check if there is another.
 		if !z.multistream {
+			// Match Read: mark the reader as ended, so a later Read
+			// returns io.EOF instead of interpreting the bytes after
+			// the member as a checksum.
+			z.err = io.EOF
 			return total, nil
 		}
 		crcWriter.Reset()

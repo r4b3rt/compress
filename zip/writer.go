@@ -2,9 +2,6 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build go1.16
-// +build go1.16
-
 package zip
 
 import (
@@ -14,6 +11,7 @@ import (
 	"hash"
 	"hash/crc32"
 	"io"
+	"io/fs"
 	"strings"
 	"unicode/utf8"
 )
@@ -43,7 +41,7 @@ type header struct {
 	raw    bool
 }
 
-// NewWriter returns a new Writer writing a zip file to w.
+// NewWriter returns a new [Writer] writing a zip file to w.
 func NewWriter(w io.Writer) *Writer {
 	return &Writer{cw: &countWriter{w: bufio.NewWriter(w)}}
 }
@@ -66,7 +64,7 @@ func (w *Writer) Flush() error {
 }
 
 // SetComment sets the end-of-central-directory comment field.
-// It can only be called before Close.
+// It can only be called before [Writer.Close].
 func (w *Writer) SetComment(comment string) error {
 	if len(comment) > uint16max {
 		return errors.New("zip: Writer.Comment too long")
@@ -91,48 +89,65 @@ func (w *Writer) Close() error {
 
 	// write central directory
 	start := w.cw.count
+	usedZip64 := false
 	for _, h := range w.dir {
+		// For the Central Directory, we always have the correct sizes.
+		//
+		// Implementations disagree on what triggers the inclusion of a Zip64
+		// extra field: Info-ZIP only writes it if any size or offset EXCEEDS
+		// 4GiB - 1, while libarchive writes it if any size REACHES OR EXCEEDS
+		// 4GiB - 1, or if the offset EXCEEDS 4GiB - 1. The spec is ambiguous.
+		//
+		// We conservatively write Zip64 extra fields if any size or offset
+		// REACHES OR EXCEEDS 4GiB - 1, to maximize compatibility with readers.
+		// There is no ambiguity in parsing, so there is no downside to it.
+		//
+		// The spec is clear though that all and only the fields that REACH OR
+		// EXCEED 4GiB - 1 are included in the Zip64 extra, once it's present.
+		readerVersion := h.ReaderVersion
+		if h.CompressedSize64 >= uint32max || h.UncompressedSize64 >= uint32max || h.offset >= uint32max {
+			usedZip64 = true
+			readerVersion = max(readerVersion, zipVersion45)
+			var size uint16
+			var buf [28]byte // 2x uint16 + up to 3x uint64
+			eb := writeBuf(buf[:])
+			eb.uint16(zip64ExtraID)
+			eb.uint16(0) // size to be filled out later
+			if h.UncompressedSize64 >= uint32max {
+				eb.uint64(h.UncompressedSize64)
+				size += 8
+			}
+			if h.CompressedSize64 >= uint32max {
+				eb.uint64(h.CompressedSize64)
+				size += 8
+			}
+			if h.offset >= uint32max {
+				eb.uint64(h.offset)
+				size += 8
+			}
+			sb := writeBuf(buf[2:])
+			sb.uint16(size)
+			h.Extra = append(h.Extra, buf[:4+size]...)
+		}
+
 		var buf [directoryHeaderLen]byte
 		b := writeBuf(buf[:])
 		b.uint32(uint32(directoryHeaderSignature))
 		b.uint16(h.CreatorVersion)
-		b.uint16(h.ReaderVersion)
+		b.uint16(readerVersion)
 		b.uint16(h.Flags)
 		b.uint16(h.Method)
 		b.uint16(h.ModifiedTime)
 		b.uint16(h.ModifiedDate)
 		b.uint32(h.CRC32)
-		if h.isZip64() || h.offset >= uint32max {
-			// the file needs a zip64 header. store maxint in both
-			// 32 bit size fields (and offset later) to signal that the
-			// zip64 extra header should be used.
-			b.uint32(uint32max) // compressed size
-			b.uint32(uint32max) // uncompressed size
-
-			// append a zip64 extra block to Extra
-			var buf [28]byte // 2x uint16 + 3x uint64
-			eb := writeBuf(buf[:])
-			eb.uint16(zip64ExtraID)
-			eb.uint16(24) // size = 3x uint64
-			eb.uint64(h.UncompressedSize64)
-			eb.uint64(h.CompressedSize64)
-			eb.uint64(h.offset)
-			h.Extra = append(h.Extra, buf[:]...)
-		} else {
-			b.uint32(h.CompressedSize)
-			b.uint32(h.UncompressedSize)
-		}
-
+		b.uint32(uint32(min(h.CompressedSize64, uint32max)))
+		b.uint32(uint32(min(h.UncompressedSize64, uint32max)))
 		b.uint16(uint16(len(h.Name)))
 		b.uint16(uint16(len(h.Extra)))
 		b.uint16(uint16(len(h.Comment)))
 		b = b[4:] // skip disk number start and internal file attr (2x uint16)
 		b.uint32(h.ExternalAttrs)
-		if h.offset > uint32max {
-			b.uint32(uint32max)
-		} else {
-			b.uint32(uint32(h.offset))
-		}
+		b.uint32(uint32(min(h.offset, uint32max)))
 		if _, err := w.cw.Write(buf[:]); err != nil {
 			return err
 		}
@@ -156,7 +171,11 @@ func (w *Writer) Close() error {
 		f(size, offset)
 	}
 
-	if records >= uint16max || size >= uint32max || offset >= uint32max {
+	// Emit the Zip64 EOCD records whenever any individual entry needed a Zip64
+	// extra field, even if the EOCD's own fields fit in 32 bits, matching
+	// Info-ZIP (but not libarchive). See APPNOTE 4.3.9.2: "when Zip64
+	// extensions are in use, the EOCD64 record must be present."
+	if usedZip64 || records >= uint16max || size >= uint32max || offset >= uint32max {
 		var buf [directory64EndLen + directory64LocLen]byte
 		b := writeBuf(buf[:])
 
@@ -181,24 +200,18 @@ func (w *Writer) Close() error {
 		if _, err := w.cw.Write(buf[:]); err != nil {
 			return err
 		}
-
-		// store max values in the regular end record to signal
-		// that the zip64 values should be used instead
-		records = uint16max
-		size = uint32max
-		offset = uint32max
 	}
 
 	// write end record
 	var buf [directoryEndLen]byte
 	b := writeBuf(buf[:])
 	b.uint32(uint32(directoryEndSignature))
-	b = b[4:]                        // skip over disk number and first disk number (2x uint16)
-	b.uint16(uint16(records))        // number of entries this disk
-	b.uint16(uint16(records))        // number of entries total
-	b.uint32(uint32(size))           // size of directory
-	b.uint32(uint32(offset))         // start of directory
-	b.uint16(uint16(len(w.comment))) // byte size of EOCD comment
+	b = b[4:]                                 // skip over disk number and first disk number (2x uint16)
+	b.uint16(uint16(min(uint16max, records))) // number of entries this disk
+	b.uint16(uint16(min(uint16max, records))) // number of entries total
+	b.uint32(uint32(min(uint32max, size)))    // size of directory
+	b.uint32(uint32(min(uint32max, offset)))  // start of directory
+	b.uint16(uint16(len(w.comment)))          // byte size of EOCD comment
 	if _, err := w.cw.Write(buf[:]); err != nil {
 		return err
 	}
@@ -210,14 +223,14 @@ func (w *Writer) Close() error {
 }
 
 // Create adds a file to the zip file using the provided name.
-// It returns a Writer to which the file contents should be written.
-// The file contents will be compressed using the Deflate method.
+// It returns a [Writer] to which the file contents should be written.
+// The file contents will be compressed using the [Deflate] method.
 // The name must be a relative path: it must not start with a drive
 // letter (e.g. C:) or leading slash, and only forward slashes are
 // allowed. To create a directory instead of a file, add a trailing
 // slash to the name.
-// The file's contents must be written to the io.Writer before the next
-// call to Create, CreateHeader, or Close.
+// The file's contents must be written to the [io.Writer] before the next
+// call to [Writer.Create], [Writer.CreateHeader], or [Writer.Close].
 func (w *Writer) Create(name string) (io.Writer, error) {
 	header := &FileHeader{
 		Name:   name,
@@ -264,13 +277,13 @@ func (w *Writer) prepare(fh *FileHeader) error {
 	return nil
 }
 
-// CreateHeader adds a file to the zip archive using the provided FileHeader
-// for the file metadata. Writer takes ownership of fh and may mutate
-// its fields. The caller must not modify fh after calling CreateHeader.
+// CreateHeader adds a file to the zip archive using the provided [FileHeader]
+// for the file metadata. [Writer] takes ownership of fh and may mutate
+// its fields. The caller must not modify fh after calling [Writer.CreateHeader].
 //
-// This returns a Writer to which the file contents should be written.
+// This returns a [Writer] to which the file contents should be written.
 // The file's contents must be written to the io.Writer before the next
-// call to Create, CreateHeader, CreateRaw, or Close.
+// call to [Writer.Create], [Writer.CreateHeader], [Writer.CreateRaw], or [Writer.Close].
 func (w *Writer) CreateHeader(fh *FileHeader) (io.Writer, error) {
 	if err := w.prepare(fh); err != nil {
 		return nil, err
@@ -391,69 +404,98 @@ func writeHeader(w io.Writer, h *header) error {
 	if len(h.Name) > maxUint16 {
 		return errLongName
 	}
-	if len(h.Extra) > maxUint16 {
+
+	// The correct behavior of a streaming writer, implemented by Info-ZIP 3.0,
+	// would be to write 0xFFFFFFFF in the size fields and then write a Zip64
+	// extra field with the sizes at zero (to signal they are stored in a ZIP64
+	// data descriptor, in case the file is > 4GiB).
+	//
+	// We don't do that, and instead write zeroes directly in the size fields,
+	// because that wastes 28 bytes for every file smaller than 4GiB, and
+	// because it would change the encoding of nearly every zip file created by
+	// archive/zip. (No one should rely on it being stable, but still.)
+	//
+	// Anyway, the Local File Header is not that important, as the Central
+	// Directory is authoritative, and there we always write the correct sizes.
+	//
+	// If we do know the sizes, because [Writer.CreateRaw] is used and the data
+	// descriptor flag is not set, then we write them to the header. If either
+	// size reaches 4GiB, we write 0xFFFFFFFF placeholders and a Zip64 extra
+	// field with BOTH sizes, per the spec and matching Info-ZIP. Note this is
+	// different from the Central Directory Zip64 extra field logic, somehow.
+	//
+	// (One final interesting case that doesn't apply to us: if the input is
+	// streaming but the output is seekable, Info-ZIP always writes Zip64 extra
+	// fields, and then goes back and patches in the sizes, even for files < 4GiB.)
+
+	var zip64ExtraInfo []byte
+	readerVersion := h.ReaderVersion
+	noDataDescriptor := h.raw && !h.hasDataDescriptor()
+	if noDataDescriptor && (h.CompressedSize64 > uint32max || h.UncompressedSize64 > uint32max) {
+		readerVersion = max(readerVersion, zipVersion45)
+		zip64ExtraInfo = make([]byte, 20) // 2x uint16 + 2x uint64
+		b := writeBuf(zip64ExtraInfo)
+		b.uint16(zip64ExtraID)
+		b.uint16(16) // size of Zip64 extra field data
+		b.uint64(h.UncompressedSize64)
+		b.uint64(h.CompressedSize64)
+	}
+	if len(h.Extra)+len(zip64ExtraInfo) > maxUint16 {
 		return errLongExtra
 	}
 
 	var buf [fileHeaderLen]byte
 	b := writeBuf(buf[:])
 	b.uint32(uint32(fileHeaderSignature))
-	b.uint16(h.ReaderVersion)
+	b.uint16(readerVersion)
 	b.uint16(h.Flags)
 	b.uint16(h.Method)
 	b.uint16(h.ModifiedTime)
 	b.uint16(h.ModifiedDate)
-	// In raw mode (caller does the compression), the values are either
-	// written here or in the trailing data descriptor based on the header
-	// flags.
-	if h.raw && !h.hasDataDescriptor() {
+	if noDataDescriptor {
 		b.uint32(h.CRC32)
-		b.uint32(uint32(min64(h.CompressedSize64, uint32max)))
-		b.uint32(uint32(min64(h.UncompressedSize64, uint32max)))
+		if zip64ExtraInfo != nil {
+			b.uint32(uint32max)
+			b.uint32(uint32max)
+		} else {
+			b.uint32(uint32(h.CompressedSize64))
+			b.uint32(uint32(h.UncompressedSize64))
+		}
 	} else {
-		// When this package handle the compression, these values are
-		// always written to the trailing data descriptor.
 		b.uint32(0) // crc32
 		b.uint32(0) // compressed size
 		b.uint32(0) // uncompressed size
 	}
 	b.uint16(uint16(len(h.Name)))
-	b.uint16(uint16(len(h.Extra)))
+	b.uint16(uint16(len(h.Extra) + len(zip64ExtraInfo)))
 	if _, err := w.Write(buf[:]); err != nil {
 		return err
 	}
 	if _, err := io.WriteString(w, h.Name); err != nil {
 		return err
 	}
-	_, err := w.Write(h.Extra)
-	return err
-}
-
-func min64(x, y uint64) uint64 {
-	if x < y {
-		return x
+	if _, err := w.Write(h.Extra); err != nil {
+		return err
 	}
-	return y
+	if _, err := w.Write(zip64ExtraInfo); err != nil {
+		return err
+	}
+	return nil
 }
 
-// Deprecated: CreateHeaderRaw is replaced by CreateRaw (stdlib name).
-func (w *Writer) CreateHeaderRaw(fh *FileHeader) (io.Writer, error) {
-	return w.CreateHeader(fh)
-}
-
-// CreateRaw adds a file to the zip archive using the provided FileHeader and
-// returns a Writer to which the file contents should be written. The file's
-// contents must be written to the io.Writer before the next call to Create,
-// CreateHeader, CreateRaw, or Close.
+// CreateRaw adds a file to the zip archive using the provided [FileHeader] and
+// returns a [Writer] to which the file contents should be written. The file's
+// contents must be written to the io.Writer before the next call to [Writer.Create],
+// [Writer.CreateHeader], [Writer.CreateRaw], or [Writer.Close].
 //
-// In contrast to CreateHeader, the bytes passed to Writer are not compressed.
+// In contrast to [Writer.CreateHeader], the bytes passed to Writer are not compressed.
 func (w *Writer) CreateRaw(fh *FileHeader) (io.Writer, error) {
 	if err := w.prepare(fh); err != nil {
 		return nil, err
 	}
 
-	fh.CompressedSize = uint32(min64(fh.CompressedSize64, uint32max))
-	fh.UncompressedSize = uint32(min64(fh.UncompressedSize64, uint32max))
+	fh.CompressedSize = uint32(min(fh.CompressedSize64, uint32max))
+	fh.UncompressedSize = uint32(min(fh.UncompressedSize64, uint32max))
 
 	h := &header{
 		FileHeader: fh,
@@ -478,9 +520,8 @@ func (w *Writer) CreateRaw(fh *FileHeader) (io.Writer, error) {
 	return fw, nil
 }
 
-// Copy copies the file f (obtained from a Reader) into w. It copies the raw
+// Copy copies the file f (obtained from a [Reader]) into w. It copies the raw
 // form directly bypassing decompression, compression, and validation.
-// CHANGE: Optional file name cannot be specified any more due to stdlib api.
 func (w *Writer) Copy(f *File) error {
 	r, err := f.OpenRaw()
 	if err != nil {
@@ -495,13 +536,51 @@ func (w *Writer) Copy(f *File) error {
 }
 
 // RegisterCompressor registers or overrides a custom compressor for a specific
-// method ID. If a compressor for a given method is not found, Writer will
+// method ID. If a compressor for a given method is not found, [Writer] will
 // default to looking up the compressor at the package level.
 func (w *Writer) RegisterCompressor(method uint16, comp Compressor) {
 	if w.compressors == nil {
 		w.compressors = make(map[uint16]Compressor)
 	}
 	w.compressors[method] = comp
+}
+
+// AddFS adds the files from fs.FS to the archive.
+// It walks the directory tree starting at the root of the filesystem
+// adding each file to the zip using deflate while maintaining the directory structure.
+func (w *Writer) AddFS(fsys fs.FS) error {
+	return fs.WalkDir(fsys, ".", func(name string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return errors.New("zip: cannot add non-regular file")
+		}
+		h, err := FileInfoHeader(info)
+		if err != nil {
+			return err
+		}
+		h.Name = name
+		h.Method = Deflate
+		fw, err := w.CreateHeader(h)
+		if err != nil {
+			return err
+		}
+		f, err := fsys.Open(name)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = io.Copy(fw, f)
+		return err
+	})
 }
 
 func (w *Writer) compressor(method uint16) Compressor {
@@ -560,7 +639,7 @@ func (w *fileWriter) close() error {
 	fh.CompressedSize64 = uint64(w.compCount.count)
 	fh.UncompressedSize64 = uint64(w.rawCount.count)
 
-	if fh.isZip64() {
+	if w.CompressedSize64 > uint32max || w.UncompressedSize64 > uint32max {
 		fh.CompressedSize = uint32max
 		fh.UncompressedSize = uint32max
 		fh.ReaderVersion = zipVersion45 // requires 4.5 - File uses ZIP64 format extensions
@@ -576,13 +655,13 @@ func (w *fileWriter) writeDataDescriptor() error {
 	if !w.hasDataDescriptor() {
 		return nil
 	}
-	// Write data descriptor. This is more complicated than one would
-	// think, see e.g. comments in zipfile.c:putextended() and
-	// http://bugs.sun.com/bugdatabase/view_bug.do?bug_id=7073588.
-	// The approach here is to write 8 byte sizes if needed without
-	// adding a zip64 extra in the local header (too late anyway).
+	// See the comment in [writeHeader] about how and why we don't signal ZIP64
+	// mode in the local file header. If one of the sizes turns out to exceed
+	// 4GiB, we use the 64-bit sizes anyway, for lack of alternatives.
+	//
+	// See also https://bugs.openjdk.org/browse/JDK-7073588.
 	var buf []byte
-	if w.isZip64() {
+	if w.CompressedSize64 > uint32max || w.UncompressedSize64 > uint32max {
 		buf = make([]byte, dataDescriptor64Len)
 	} else {
 		buf = make([]byte, dataDescriptorLen)
@@ -590,7 +669,7 @@ func (w *fileWriter) writeDataDescriptor() error {
 	b := writeBuf(buf)
 	b.uint32(dataDescriptorSignature) // de-facto standard, required by OS X
 	b.uint32(w.CRC32)
-	if w.isZip64() {
+	if w.CompressedSize64 > uint32max || w.UncompressedSize64 > uint32max {
 		b.uint64(w.CompressedSize64)
 		b.uint64(w.UncompressedSize64)
 	} else {

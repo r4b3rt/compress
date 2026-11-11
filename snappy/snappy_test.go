@@ -10,7 +10,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"net/http"
 	"os"
@@ -96,7 +95,7 @@ func TestEmpty(t *testing.T) {
 func TestSmallCopy(t *testing.T) {
 	for _, ebuf := range [][]byte{nil, make([]byte, 20), make([]byte, 64)} {
 		for _, dbuf := range [][]byte{nil, make([]byte, 20), make([]byte, 64)} {
-			for i := 0; i < 32; i++ {
+			for i := range 32 {
 				s := "aaaa" + strings.Repeat("b", i) + "aaaabbbb"
 				if err := roundtrip([]byte(s), ebuf, dbuf); err != nil {
 					t.Errorf("len(ebuf)=%d, len(dbuf)=%d, i=%d: %v", len(ebuf), len(dbuf), i, err)
@@ -147,6 +146,15 @@ func TestInvalidVarint(t *testing.T) {
 		// varint] (up to a maximum of 2^32 - 1)".
 		"valid varint (as uint64), but value overflows uint32",
 		"\x80\x80\x80\x80\x10",
+	}, {
+		// 8-byte overlong varint encoding value 4. The format spec limits
+		// the varint preamble to 5 bytes. binary.Uvarint accepts up to 10
+		// bytes so this decodes to a valid uint32 value (4), but the
+		// overlong encoding must be rejected.
+		"overlong varint (8 bytes encoding value 4), exceeds 5-byte max",
+		"\x84\x80\x80\x80\x80\x80\x80\x00" +
+			"\x00\x00\x00\x00\x00\x00\x00" +
+			"\x30",
 	}}
 
 	for _, tc := range testCases {
@@ -509,7 +517,7 @@ const (
 
 func TestDecodeGoldenInput(t *testing.T) {
 	tDir := filepath.FromSlash(*testdataDir)
-	src, err := ioutil.ReadFile(filepath.Join(tDir, goldenCompressed))
+	src, err := os.ReadFile(filepath.Join(tDir, goldenCompressed))
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
@@ -517,7 +525,7 @@ func TestDecodeGoldenInput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Decode: %v", err)
 	}
-	want, err := ioutil.ReadFile(filepath.Join(tDir, goldenText))
+	want, err := os.ReadFile(filepath.Join(tDir, goldenText))
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
@@ -599,13 +607,13 @@ func TestFramingFormat(t *testing.T) {
 	// because it is larger than maxBlockSize (64k).
 	src := make([]byte, 1e6)
 	rng := rand.New(rand.NewSource(1))
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		if i%2 == 0 {
-			for j := 0; j < 1e5; j++ {
+			for j := range int(1e5) {
 				src[1e5*i+j] = uint8(rng.Intn(256))
 			}
 		} else {
-			for j := 0; j < 1e5; j++ {
+			for j := range int(1e5) {
 				src[1e5*i+j] = uint8(i)
 			}
 		}
@@ -615,7 +623,7 @@ func TestFramingFormat(t *testing.T) {
 	if _, err := NewWriter(buf).Write(src); err != nil {
 		t.Fatalf("Write: encoding: %v", err)
 	}
-	dst, err := ioutil.ReadAll(NewReader(buf))
+	dst, err := io.ReadAll(NewReader(buf))
 	if err != nil {
 		t.Fatalf("ReadAll: decoding: %v", err)
 	}
@@ -666,7 +674,7 @@ func TestWriterGoldenOutput(t *testing.T) {
 		"\x0d\x01",         // Compressed payload: tagCopy1,   length=7,  offset=1.
 		"\x08\x65\x66\x43", // Compressed payload: tagLiteral, length=3,  "efC".
 		"\x4e\x01\x00",     // Compressed payload: tagCopy2,   length=20, offset=1.
-		"\x4e\x58\x00",     // Compressed payload: tagCopy2,   length=20, offset=88.
+		"\x4e\x3a\x00",     // Compressed payload: tagCopy2,   length=20, offset=58.
 		"\x00\x67",         // Compressed payload: tagLiteral, length=1,  "g".
 	}, "")
 	if got != want {
@@ -708,7 +716,7 @@ loop:
 			t.Errorf("i=%#02x: Close: %v", i, err)
 			continue
 		}
-		got, err := ioutil.ReadAll(NewReader(buf))
+		got, err := io.ReadAll(NewReader(buf))
 		if err != nil {
 			t.Errorf("i=%#02x: ReadAll: %v", i, err)
 			continue
@@ -744,7 +752,7 @@ func TestReaderUncompressedDataOK(t *testing.T) {
 		"\x68\x10\xe6\xb6" + // Checksum.
 		"\x61\x62\x63\x64", // Uncompressed payload: "abcd".
 	))
-	g, err := ioutil.ReadAll(r)
+	g, err := io.ReadAll(r)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -758,7 +766,7 @@ func TestReaderUncompressedDataNoPayload(t *testing.T) {
 		"\x01\x04\x00\x00" + // Uncompressed chunk, 4 bytes long.
 		"", // No payload; corrupt input.
 	))
-	if _, err := ioutil.ReadAll(r); err != ErrCorrupt {
+	if _, err := io.ReadAll(r); err != ErrCorrupt {
 		t.Fatalf("got %v, want %v", err, ErrCorrupt)
 	}
 }
@@ -772,7 +780,7 @@ func TestReaderUncompressedDataTooLong(t *testing.T) {
 		"\x01\x05\x00\x01" + // Uncompressed chunk, n bytes long.
 		strings.Repeat("\x00", n),
 	))
-	if _, err := ioutil.ReadAll(r); err != ErrCorrupt {
+	if _, err := io.ReadAll(r); err != ErrCorrupt {
 		t.Fatalf("got %v, want %v", err, ErrCorrupt)
 	}
 }
@@ -795,7 +803,7 @@ func TestReaderReset(t *testing.T) {
 			continue
 		}
 		r.Reset(strings.NewReader(s))
-		got, err := ioutil.ReadAll(r)
+		got, err := io.ReadAll(r)
 		switch s {
 		case encoded:
 			if err != nil {
@@ -910,7 +918,7 @@ func TestWriterReset(t *testing.T) {
 					continue
 				}
 			}
-			got, err := ioutil.ReadAll(NewReader(buf))
+			got, err := io.ReadAll(NewReader(buf))
 			if err != nil {
 				t.Errorf("#%d: ReadAll: %v", i, err)
 				failed = true
@@ -945,7 +953,7 @@ func TestWriterResetWithoutFlush(t *testing.T) {
 	if err := w.Flush(); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
-	got, err := ioutil.ReadAll(NewReader(buf1))
+	got, err := io.ReadAll(NewReader(buf1))
 	if err != nil {
 		t.Fatalf("ReadAll: %v", err)
 	}
@@ -1022,7 +1030,7 @@ func testOrBenchmark(b testing.TB) string {
 }
 
 func readFile(b testing.TB, filename string) []byte {
-	src, err := ioutil.ReadFile(filename)
+	src, err := os.ReadFile(filename)
 	if err != nil {
 		b.Skipf("skipping %s: %v", testOrBenchmark(b), err)
 	}

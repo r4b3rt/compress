@@ -7,9 +7,13 @@ package gzip
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
+	"os"
+	"reflect"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -26,7 +30,10 @@ func TestEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)
 	}
-	b, err := ioutil.ReadAll(r)
+	if want := (Header{OS: 255}); !reflect.DeepEqual(r.Header, want) {
+		t.Errorf("Header mismatch:\ngot  %#v\nwant %#v", r.Header, want)
+	}
+	b, err := io.ReadAll(r)
 	if err != nil {
 		t.Fatalf("ReadAll: %v", err)
 	}
@@ -59,7 +66,7 @@ func TestRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)
 	}
-	b, err := ioutil.ReadAll(r)
+	b, err := io.ReadAll(r)
 	if err != nil {
 		t.Fatalf("ReadAll: %v", err)
 	}
@@ -144,7 +151,7 @@ func TestLatin1RoundTrip(t *testing.T) {
 			t.Errorf("NewReader: %v", err)
 			continue
 		}
-		_, err = ioutil.ReadAll(r)
+		_, err = io.ReadAll(r)
 		if err != nil {
 			t.Errorf("ReadAll: %v", err)
 			continue
@@ -214,7 +221,7 @@ func TestConcat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, err := ioutil.ReadAll(r)
+	data, err := io.ReadAll(r)
 	if string(data) != "hello world\n" || err != nil {
 		t.Fatalf("ReadAll = %q, %v, want %q, nil", data, err, "hello world")
 	}
@@ -235,22 +242,96 @@ func TestWriterReset(t *testing.T) {
 	}
 }
 
+type limitedWriter struct {
+	N int
+}
+
+func (l *limitedWriter) Write(p []byte) (n int, err error) {
+	if n := l.N; n < len(p) {
+		l.N = 0
+		return n, io.ErrShortWrite
+	}
+	l.N -= len(p)
+	return len(p), nil
+}
+
+// Write should never return more bytes than the input slice.
+func TestLimitedWrite(t *testing.T) {
+	msg := []byte("a")
+
+	for lim := 2; lim < 20; lim++ {
+		z := NewWriter(&limitedWriter{lim})
+		if n, _ := z.Write(msg); n > len(msg) {
+			t.Errorf("Write() = %d, want %d or less", n, len(msg))
+		}
+
+		z.Reset(&limitedWriter{lim})
+		z.Header = Header{
+			Comment: "comment",
+			Extra:   []byte("extra"),
+			ModTime: time.Now(),
+			Name:    "name",
+			OS:      1,
+		}
+		if n, _ := z.Write(msg); n > len(msg) {
+			t.Errorf("Write() = %d, want %d or less", n, len(msg))
+		}
+	}
+}
+
+// shortWriter writes the first ok writes in full, then reports writing
+// fewer bytes than it was given, without an error.
+type shortWriter struct{ ok int }
+
+func (w *shortWriter) Write(p []byte) (int, error) {
+	if w.ok > 0 {
+		w.ok--
+		return len(p), nil
+	}
+	return len(p) / 2, nil
+}
+
+func TestShortHeaderWrite(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		header Header
+	}{
+		{name: "fixed", header: Header{}},
+		{name: "extra", header: Header{Extra: []byte("extra")}},
+		{name: "name", header: Header{Name: "name"}},
+		{name: "comment", header: Header{Comment: "comment"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ok := 1 // the 10-byte fixed header
+			if tc.name == "fixed" {
+				ok = 0
+			}
+			z := NewWriter(&shortWriter{ok: ok})
+			z.Header = tc.header
+			n, err := z.Write([]byte("a"))
+			if n != 0 || err != io.ErrShortWrite {
+				t.Errorf("Write() = %d, %v, want 0, %v", n, err, io.ErrShortWrite)
+			}
+		})
+	}
+}
+
 var testbuf []byte
 
 func testFile(i, level int, t *testing.T) {
-	dat, _ := ioutil.ReadFile("testdata/test.json")
+	dat, _ := os.ReadFile("testdata/test.json")
 	dl := len(dat)
 	if len(testbuf) != i*dl {
 		// Make results predictable
 		testbuf = make([]byte, i*dl)
-		for j := 0; j < i; j++ {
+		for j := range i {
 			copy(testbuf[j*dl:j*dl+dl], dat)
 		}
 	}
 
 	br := bytes.NewBuffer(testbuf)
 	var buf bytes.Buffer
-	w, err := NewWriterLevel(&buf, DefaultCompression)
+	w, err := NewWriterLevel(&buf, level)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,7 +350,7 @@ func testFile(i, level int, t *testing.T) {
 	if err != nil {
 		t.Fatal(err.Error())
 	}
-	decoded, err := ioutil.ReadAll(r)
+	decoded, err := io.ReadAll(r)
 	if err != nil {
 		t.Fatal(err.Error())
 	}
@@ -307,13 +388,63 @@ func TestFile200(t *testing.T) {
 	testFile(200, BestSpeed, t)
 }
 
+func TestFileWindow(t *testing.T) {
+	for sz := MinCustomWindowSize; sz <= MaxCustomWindowSize; sz *= 2 {
+		t.Run(fmt.Sprint(sz), func(t *testing.T) {
+			testFileWindow(1, sz, t)
+		})
+	}
+}
+
+func testFileWindow(i, window int, t *testing.T) {
+	dat, _ := os.ReadFile("testdata/test.json")
+	dl := len(dat)
+	if len(testbuf) != i*dl {
+		// Make results predictable
+		testbuf = make([]byte, i*dl)
+		for j := range i {
+			copy(testbuf[j*dl:j*dl+dl], dat)
+		}
+	}
+
+	br := bytes.NewBuffer(testbuf)
+	var buf bytes.Buffer
+	w, err := NewWriterWindow(&buf, window)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := io.Copy(w, br)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int(n) != len(testbuf) {
+		t.Fatal("Short write:", n, "!=", testbuf)
+	}
+	err = w.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("size: %d bytes", buf.Len())
+	r, err := NewReader(&buf)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	decoded, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+	if !bytes.Equal(testbuf, decoded) {
+		t.Errorf("decoded content does not match.")
+	}
+}
+
 func testBigGzip(i int, t *testing.T) {
+	rng := rand.New(rand.NewSource(1337))
 	if len(testbuf) != i {
 		// Make results predictable
-		rand.Seed(1337)
 		testbuf = make([]byte, i)
 		for idx := range testbuf {
-			testbuf[idx] = byte(65 + rand.Intn(20))
+			testbuf[idx] = byte(65 + rng.Intn(20))
 		}
 	}
 	c := BestCompression
@@ -343,7 +474,7 @@ func testBigGzip(i int, t *testing.T) {
 	if err != nil {
 		t.Fatal(err.Error())
 	}
-	decoded, err := ioutil.ReadAll(r)
+	decoded, err := io.ReadAll(r)
 	if err != nil {
 		t.Fatal(err.Error())
 	}
@@ -383,20 +514,20 @@ func TestDeterministicL7(t *testing.T) { testDeterm(7, t) }
 func TestDeterministicL8(t *testing.T) { testDeterm(8, t) }
 func TestDeterministicL9(t *testing.T) { testDeterm(9, t) }
 
-func testDeterm(i int, t *testing.T) {
+func testDeterm(level int, t *testing.T) {
 	var length = 500000
 	if testing.Short() {
 		length = 100000
 	}
-	rand.Seed(1337)
+	rng := rand.New(rand.NewSource(1337))
 	t1 := make([]byte, length)
 	for idx := range t1 {
-		t1[idx] = byte(65 + rand.Intn(8))
+		t1[idx] = byte(65 + rng.Intn(8))
 	}
 
 	br := bytes.NewBuffer(t1)
 	var b1 bytes.Buffer
-	w, err := NewWriterLevel(&b1, i)
+	w, err := NewWriterLevel(&b1, level)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -409,15 +540,15 @@ func testDeterm(i int, t *testing.T) {
 
 	// We recreate the buffer, so we have a goos chance of getting a
 	// different memory address.
-	rand.Seed(1337)
+	rng = rand.New(rand.NewSource(1337))
 	t2 := make([]byte, length)
 	for idx := range t2 {
-		t2[idx] = byte(65 + rand.Intn(8))
+		t2[idx] = byte(65 + rng.Intn(8))
 	}
 
 	br2 := bytes.NewBuffer(t2)
 	var b2 bytes.Buffer
-	w2, err := NewWriterLevel(&b2, i)
+	w2, err := NewWriterLevel(&b2, level)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -443,7 +574,7 @@ func testDeterm(i int, t *testing.T) {
 	b2b := b2.Bytes()
 
 	if !bytes.Equal(b1b, b2b) {
-		t.Fatalf("Level %d did not produce deterministric result, len(a) = %d, len(b) = %d", i, len(b1b), len(b2b))
+		t.Fatalf("Level %d did not produce deterministric result, len(a) = %d, len(b) = %d", level, len(b1b), len(b2b))
 	}
 }
 
@@ -460,17 +591,17 @@ func BenchmarkGzipL8(b *testing.B)  { benchmarkGzipN(b, 8) }
 func BenchmarkGzipL9(b *testing.B)  { benchmarkGzipN(b, 9) }
 
 func benchmarkGzipN(b *testing.B, level int) {
-	dat, _ := ioutil.ReadFile("testdata/test.json")
+	dat, _ := os.ReadFile("testdata/test.json")
 	dat = append(dat, dat...)
 	dat = append(dat, dat...)
 	dat = append(dat, dat...)
 	dat = append(dat, dat...)
 	dat = append(dat, dat...)
 	b.SetBytes(int64(len(dat)))
-	w, _ := NewWriterLevel(ioutil.Discard, level)
+	w, _ := NewWriterLevel(io.Discard, level)
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		w.Reset(ioutil.Discard)
+		w.Reset(io.Discard)
 		n, err := w.Write(dat)
 		if n != len(dat) {
 			panic("short write")
@@ -485,42 +616,40 @@ func benchmarkGzipN(b *testing.B, level int) {
 	}
 }
 
-/*
-func BenchmarkOldGzipL1(b *testing.B) { benchmarkOldGzipN(b, 1) }
-func BenchmarkOldGzipL2(b *testing.B) { benchmarkOldGzipN(b, 2) }
-func BenchmarkOldGzipL3(b *testing.B) { benchmarkOldGzipN(b, 3) }
-func BenchmarkOldGzipL4(b *testing.B) { benchmarkOldGzipN(b, 4) }
-func BenchmarkOldGzipL5(b *testing.B) { benchmarkOldGzipN(b, 5) }
-func BenchmarkOldGzipL6(b *testing.B) { benchmarkOldGzipN(b, 6) }
-func BenchmarkOldGzipL7(b *testing.B) { benchmarkOldGzipN(b, 7) }
-func BenchmarkOldGzipL8(b *testing.B) { benchmarkOldGzipN(b, 8) }
-func BenchmarkOldGzipL9(b *testing.B) { benchmarkOldGzipN(b, 9) }
+func BenchmarkCompressAllocations(b *testing.B) {
+	payload := []byte(strings.Repeat("Tiny payload", 20))
+	for j := -2; j <= 9; j++ {
+		b.Run("level("+strconv.Itoa(j)+")", func(b *testing.B) {
+			b.Run("gzip", func(b *testing.B) {
+				b.ReportAllocs()
 
-func benchmarkOldGzipN(b *testing.B, level int) {
-	dat, _ := ioutil.ReadFile("testdata/test.json")
-	dat = append(dat, dat...)
-	dat = append(dat, dat...)
-	dat = append(dat, dat...)
-	dat = append(dat, dat...)
-	dat = append(dat, dat...)
-
-	b.SetBytes(int64(len(dat)))
-	w, _ := oldgz.NewWriterLevel(ioutil.Discard, level)
-	b.ResetTimer()
-	for n := 0; n < b.N; n++ {
-		w.Reset(ioutil.Discard)
-		n, err := w.Write(dat)
-		if n != len(dat) {
-			panic("short write")
-		}
-		if err != nil {
-			panic(err)
-		}
-		err = w.Close()
-		if err != nil {
-			panic(err)
-		}
+				for i := 0; i < b.N; i++ {
+					w, err := NewWriterLevel(io.Discard, j)
+					if err != nil {
+						b.Fatal(err)
+					}
+					w.Write(payload)
+					w.Close()
+				}
+			})
+		})
 	}
 }
 
-*/
+func BenchmarkCompressAllocationsSingle(b *testing.B) {
+	payload := []byte(strings.Repeat("Tiny payload", 20))
+	const level = 2
+
+	b.Run("gzip", func(b *testing.B) {
+		b.ReportAllocs()
+
+		for i := 0; i < b.N; i++ {
+			w, err := NewWriterLevel(io.Discard, level)
+			if err != nil {
+				b.Fatal(err)
+			}
+			w.Write(payload)
+			w.Close()
+		}
+	})
+}

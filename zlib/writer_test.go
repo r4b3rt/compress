@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"testing"
 )
@@ -33,7 +32,7 @@ func testFileLevelDict(t *testing.T, fn string, level int, d string) {
 		return
 	}
 	defer golden.Close()
-	b0, err0 := ioutil.ReadAll(golden)
+	b0, err0 := io.ReadAll(golden)
 	if err0 != nil {
 		t.Errorf("%s (level=%d, dict=%q): %v", fn, level, d, err0)
 		return
@@ -73,7 +72,7 @@ func testLevelDict(t *testing.T, fn string, b0 []byte, level int, d string) {
 	defer zlibr.Close()
 
 	// Compare the decompressed data.
-	b1, err1 := ioutil.ReadAll(zlibr)
+	b1, err1 := io.ReadAll(zlibr)
 	if err1 != nil {
 		t.Errorf("%s (level=%d, dict=%q): %v", fn, level, d, err1)
 		return
@@ -82,7 +81,7 @@ func testLevelDict(t *testing.T, fn string, b0 []byte, level int, d string) {
 		t.Errorf("%s (level=%d, dict=%q): length mismatch %d versus %d", fn, level, d, len(b0), len(b1))
 		return
 	}
-	for i := 0; i < len(b0); i++ {
+	for i := range b0 {
 		if b0[i] != b1[i] {
 			t.Errorf("%s (level=%d, dict=%q): mismatch at %d, 0x%02x versus 0x%02x\n", fn, level, d, i, b0[i], b1[i])
 			return
@@ -94,7 +93,7 @@ func testFileLevelDictReset(t *testing.T, fn string, level int, dict []byte) {
 	var b0 []byte
 	var err error
 	if fn != "" {
-		b0, err = ioutil.ReadFile(fn)
+		b0, err = os.ReadFile(fn)
 		if err != nil {
 			t.Errorf("%s (level=%d): %v", fn, level, err)
 			return
@@ -154,24 +153,36 @@ func TestWriter(t *testing.T) {
 }
 
 func TestWriterBig(t *testing.T) {
-	for _, fn := range filenames {
+	for i, fn := range filenames {
 		testFileLevelDict(t, fn, DefaultCompression, "")
 		testFileLevelDict(t, fn, NoCompression, "")
 		testFileLevelDict(t, fn, HuffmanOnly, "")
 		for level := BestSpeed; level <= BestCompression; level++ {
 			testFileLevelDict(t, fn, level, "")
+			if level >= 1 && testing.Short() {
+				break
+			}
+		}
+		if i == 0 && testing.Short() {
+			break
 		}
 	}
 }
 
 func TestWriterDict(t *testing.T) {
 	const dictionary = "0123456789."
-	for _, fn := range filenames {
+	for i, fn := range filenames {
 		testFileLevelDict(t, fn, DefaultCompression, dictionary)
 		testFileLevelDict(t, fn, NoCompression, dictionary)
 		testFileLevelDict(t, fn, HuffmanOnly, dictionary)
 		for level := BestSpeed; level <= BestCompression; level++ {
 			testFileLevelDict(t, fn, level, dictionary)
+			if level >= 1 && testing.Short() {
+				break
+			}
+		}
+		if i == 0 && testing.Short() {
+			break
 		}
 	}
 }

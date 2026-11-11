@@ -10,40 +10,58 @@ import (
 
 // history contains the information transferred between blocks.
 type history struct {
-	b             []byte
-	huffTree      *huff0.Scratch
-	recentOffsets [3]int
+	// Literal decompression
+	huffTree *huff0.Scratch
+
+	// Sequence decompression
 	decoders      sequenceDecs
-	windowSize    int
-	maxSize       int
-	error         bool
-	dict          *dict
+	recentOffsets [3]int
+
+	// History buffer...
+	b []byte
+
+	// ignoreBuffer is meant to ignore a number of bytes
+	// when checking for matches in history
+	ignoreBuffer int
+
+	windowSize int
+	error      bool
+	dict       *dict
+
+	// ring backs b when streaming (see ensureBlockRing).
+	// ext holds the part of the previous lap of ring still in the window,
+	// which precedes b[0] in the stream; nil when b holds all history.
+	// The previous lap is ring[extStart:extEnd].
+	ring     []byte
+	ext      []byte
+	extStart int
+	extEnd   int
 }
 
 // reset will reset the history to initial state of a frame.
 // The history must already have been initialized to the desired size.
 func (h *history) reset() {
 	h.b = h.b[:0]
+	h.ext = nil
+	h.extStart, h.extEnd = 0, 0
+	h.ignoreBuffer = 0
 	h.error = false
 	h.recentOffsets = [3]int{1, 4, 8}
-	if f := h.decoders.litLengths.fse; f != nil && !f.preDefined {
-		fseDecoderPool.Put(f)
-	}
-	if f := h.decoders.offsets.fse; f != nil && !f.preDefined {
-		fseDecoderPool.Put(f)
-	}
-	if f := h.decoders.matchLengths.fse; f != nil && !f.preDefined {
-		fseDecoderPool.Put(f)
-	}
-	h.decoders = sequenceDecs{}
-	if h.huffTree != nil {
-		if h.dict == nil || h.dict.litEnc != h.huffTree {
-			huffDecoderPool.Put(h.huffTree)
-		}
-	}
+	h.decoders.freeDecoders()
+	h.decoders = sequenceDecs{br: h.decoders.br}
+	h.freeHuffDecoder()
 	h.huffTree = nil
 	h.dict = nil
 	//printf("history created: %+v (l: %d, c: %d)", *h, len(h.b), cap(h.b))
+}
+
+func (h *history) freeHuffDecoder() {
+	if h.huffTree != nil {
+		if h.dict == nil || h.dict.litEnc != h.huffTree {
+			huffDecoderPool.Put(h.huffTree)
+			h.huffTree = nil
+		}
+	}
 }
 
 func (h *history) setDict(dict *dict) {
@@ -54,33 +72,45 @@ func (h *history) setDict(dict *dict) {
 	h.decoders.litLengths = dict.llDec
 	h.decoders.offsets = dict.ofDec
 	h.decoders.matchLengths = dict.mlDec
+	h.decoders.dict = dict.content
 	h.recentOffsets = dict.offsets
 	h.huffTree = dict.litEnc
 }
 
-// append bytes to history.
-// This function will make sure there is space for it,
-// if the buffer has been allocated with enough extra space.
-func (h *history) append(b []byte) {
-	if len(b) >= h.windowSize {
-		// Discard all history by simply overwriting
-		h.b = h.b[:h.windowSize]
-		copy(h.b, b[len(b)-h.windowSize:])
-		return
+// ensureBlockRing makes room for the next block without moving history,
+// as the reference decoder does. b is a prefix of ring capped to one block
+// of space. When a block no longer fits, the data written so far becomes
+// ext and writing restarts at the front of ring. ext is trimmed so the
+// block space ahead of b never overlaps it; with ring sized to window plus
+// two blocks of space, b and ext together always hold a full window.
+func (h *history) ensureBlockRing() {
+	// Room for the largest block plus the overrun of the fast copies.
+	ringBlockSpace := min(h.windowSize, maxCompressedBlockSize) + compressedBlockOverAlloc
+	size := h.windowSize + 2*ringBlockSpace
+	pos := len(h.b)
+	if cap(h.ring) < size || (pos > 0 && &h.b[0] != &h.ring[0]) {
+		// No ring yet, or b no longer lives in it: start one, keeping up
+		// to a window of what was decoded so far as the previous lap.
+		keep := min(pos, h.windowSize)
+		if cap(h.ring) < size {
+			h.ring = make([]byte, size)
+		}
+		h.ring = h.ring[:size]
+		copy(h.ring[size-keep:], h.b[pos-keep:])
+		h.extStart, h.extEnd = size-keep, size
+		pos = 0
+	} else if pos+ringBlockSpace > size {
+		// Wrap: everything written this lap becomes the previous lap.
+		h.extStart, h.extEnd = 0, pos
+		pos = 0
 	}
-
-	// If there is space, append it.
-	if len(b) < cap(h.b)-len(h.b) {
-		h.b = append(h.b, b...)
-		return
+	h.ring = h.ring[:size]
+	end := pos + ringBlockSpace
+	h.b = h.ring[:pos:end]
+	h.ext = nil
+	if start := max(end, h.extStart); start < h.extEnd {
+		h.ext = h.ring[start:h.extEnd]
 	}
-
-	// Move data down so we only have window size left.
-	// We know we have less than window size in b at this point.
-	discard := len(b) + len(h.b) - h.windowSize
-	copy(h.b, h.b[discard:])
-	h.b = h.b[:h.windowSize]
-	copy(h.b[h.windowSize-len(b):], b)
 }
 
 // append bytes to history without ever discarding anything.

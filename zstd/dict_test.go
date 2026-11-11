@@ -3,8 +3,12 @@ package zstd
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"math"
+	"math/rand"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/klauspost/compress/zip"
@@ -12,33 +16,8 @@ import (
 
 func TestDecoder_SmallDict(t *testing.T) {
 	// All files have CRC
-	fn := "testdata/dict-tests-small.zip"
-	data, err := ioutil.ReadFile(fn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var dicts [][]byte
-	for _, tt := range zr.File {
-		if !strings.HasSuffix(tt.Name, ".dict") {
-			continue
-		}
-		func() {
-			r, err := tt.Open()
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer r.Close()
-			in, err := ioutil.ReadAll(r)
-			if err != nil {
-				t.Fatal(err)
-			}
-			dicts = append(dicts, in)
-		}()
-	}
+	zr := testCreateZipReader("testdata/dict-tests-small.zip", t)
+	dicts := readDicts(t, zr)
 	dec, err := NewReader(nil, WithDecoderConcurrency(1), WithDecoderDicts(dicts...))
 	if err != nil {
 		t.Fatal(err)
@@ -55,7 +34,7 @@ func TestDecoder_SmallDict(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer r.Close()
-			in, err := ioutil.ReadAll(r)
+			in, err := io.ReadAll(r)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -71,17 +50,207 @@ func TestDecoder_SmallDict(t *testing.T) {
 	}
 }
 
+func buildDictLevelPathFixture() (samples [][]byte, history, src []byte) {
+	history = bytes.Repeat([]byte("build dict common phrase alpha beta gamma delta "), 16)
+	sample := func(suffix string) []byte {
+		b := append([]byte(nil), history...)
+		return append(b, suffix...)
+	}
+	samples = [][]byte{
+		sample("city=honolulu email=a@example.com status=active"),
+		sample("city=seattle email=b@example.com status=active"),
+		sample("city=london email=c@example.com status=paused"),
+		sample("city=honolulu email=d@example.com status=active"),
+	}
+	src = sample("city=honolulu email=roundtrip@example.com status=active")
+	return samples, history, src
+}
+
+func TestBuildDictLevelPathsRoundTrip(t *testing.T) {
+	samples, history, src := buildDictLevelPathFixture()
+	for _, tt := range []struct {
+		name  string
+		level EncoderLevel
+	}{
+		{name: "default"},
+		{name: "explicit", level: SpeedFastest},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dict, err := BuildDict(BuildDictOptions{
+				ID:       1,
+				Contents: samples,
+				History:  history,
+				Offsets:  [3]int{1, 4, 8},
+				Level:    tt.level,
+			})
+			if err != nil {
+				t.Fatalf("BuildDict failed: %v", err)
+			}
+
+			enc, err := NewWriter(nil, WithEncoderDict(dict), WithEncoderLevel(SpeedFastest), WithEncoderConcurrency(1))
+			if err != nil {
+				t.Fatalf("NewWriter failed: %v", err)
+			}
+			defer enc.Close()
+			encoded := enc.EncodeAll(src, nil)
+
+			dec, err := NewReader(nil, WithDecoderDicts(dict), WithDecoderConcurrency(1))
+			if err != nil {
+				t.Fatalf("NewReader failed: %v", err)
+			}
+			defer dec.Close()
+			decoded, err := dec.DecodeAll(encoded, nil)
+			if err != nil {
+				t.Fatalf("DecodeAll failed: %v", err)
+			}
+			if !bytes.Equal(decoded, src) {
+				t.Fatalf("decoded output mismatch: got %q want %q", decoded, src)
+			}
+		})
+	}
+}
+
+// Regression for https://github.com/klauspost/compress/issues/1179:
+// a homogeneous corpus with default (zero) Offsets used to emit a dictionary
+// whose recent-offsets table contained 0, which WithEncoderDict rejects.
+func TestBuildDictHomogeneousCorpusValidOffsets(t *testing.T) {
+	sample := func(seed int64) []byte {
+		const boiler = `<div class="card-grid" data-template="responsive"><style>.card-grid{display:grid;gap:6px;background:#0a0a0a;padding:4px}.card-item{color:#333;display:grid}</style><script>(function(){var n=document.querySelectorAll('[data-src]');for(var i=0;i<n.length;i++){var u=n[i].getAttribute('data-src');}})();</script>`
+		rng := rand.New(rand.NewSource(seed))
+		var out strings.Builder
+		out.WriteString(boiler)
+		for i := range 8 {
+			p := make([]byte, 32)
+			rng.Read(p)
+			out.WriteString(fmt.Sprintf(`{"url":"https://example.com/t?id=%d&p=%x"}`, i, p))
+		}
+		return []byte(out.String())
+	}
+	const sampleCount, historyLimit = 16, 8 << 10
+	samples := make([][]byte, sampleCount)
+	for i := range samples {
+		samples[i] = sample(12000 + int64(i))
+	}
+	var hist []byte
+	for _, s := range samples {
+		if len(hist)+len(s) > historyLimit {
+			break
+		}
+		hist = append(hist, s...)
+	}
+
+	dict, err := BuildDict(BuildDictOptions{
+		ID:       1,
+		Contents: samples,
+		History:  hist,
+		Level:    SpeedBetterCompression,
+	})
+	if err != nil {
+		t.Fatalf("BuildDict failed: %v", err)
+	}
+	enc, err := NewWriter(nil, WithEncoderDict(dict))
+	if err != nil {
+		t.Fatalf("WithEncoderDict rejected dictionary: %v", err)
+	}
+	enc.Close()
+	info, err := InspectDictionary(dict)
+	if err != nil {
+		t.Fatalf("InspectDictionary: %v", err)
+	}
+	for i, off := range info.Offsets() {
+		if off <= 0 {
+			t.Fatalf("offset[%d]=%d; want positive", i, off)
+		}
+		if off > info.ContentSize() {
+			t.Fatalf("offset[%d]=%d > content size %d", i, off, info.ContentSize())
+		}
+	}
+}
+
+func TestBuildDictFullyMatchableCorpusReturnsError(t *testing.T) {
+	block := bytes.Repeat([]byte("ABCDABCDABCDABCD"), 64)
+	var contents [][]byte
+	var history []byte
+	for range 32 {
+		contents = append(contents, block)
+		history = append(history, block...)
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("BuildDict panicked for fully matchable corpus: %v", r)
+		}
+	}()
+	_, err := BuildDict(BuildDictOptions{
+		ID:       1,
+		Contents: contents,
+		History:  history,
+		Level:    SpeedDefault,
+	})
+	if err == nil {
+		t.Fatal("BuildDict succeeded for corpus with no literals; want error")
+	}
+	if !strings.Contains(err.Error(), "0 literals") {
+		t.Fatalf("BuildDict error = %v, want mention 0 literals", err)
+	}
+}
+
+func TestBuildDictUnknownLevel(t *testing.T) {
+	samples, history, _ := buildDictLevelPathFixture()
+	for _, level := range []EncoderLevel{-1, speedLast} {
+		_, err := BuildDict(BuildDictOptions{
+			ID:       1,
+			Contents: samples,
+			History:  history,
+			Level:    level,
+		})
+		if err == nil {
+			t.Errorf("level %d: want error", level)
+		}
+	}
+}
+
+func BenchmarkBuildDictLevelPaths(b *testing.B) {
+	samples, history, _ := buildDictLevelPathFixture()
+	for _, tt := range []struct {
+		name  string
+		level EncoderLevel
+	}{
+		{name: "default"},
+		{name: "explicit-fastest", level: SpeedFastest},
+	} {
+		b.Run(tt.name, func(b *testing.B) {
+			_, err := BuildDict(BuildDictOptions{
+				ID:       1,
+				Contents: samples,
+				History:  history,
+				Offsets:  [3]int{1, 4, 8},
+				Level:    tt.level,
+			})
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_, err := BuildDict(BuildDictOptions{
+					ID:       1,
+					Contents: samples,
+					History:  history,
+					Offsets:  [3]int{1, 4, 8},
+					Level:    tt.level,
+				})
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 func TestEncoder_SmallDict(t *testing.T) {
 	// All files have CRC
-	fn := "testdata/dict-tests-small.zip"
-	data, err := ioutil.ReadFile(fn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
-	if err != nil {
-		t.Fatal(err)
-	}
+	zr := testCreateZipReader("testdata/dict-tests-small.zip", t)
 	var dicts [][]byte
 	var encs []*Encoder
 	var noDictEncs []*Encoder
@@ -97,7 +266,7 @@ func TestEncoder_SmallDict(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer r.Close()
-			in, err := ioutil.ReadAll(r)
+			in, err := io.ReadAll(r)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -139,7 +308,7 @@ func TestEncoder_SmallDict(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer r.Close()
-		in, err := ioutil.ReadAll(r)
+		in, err := io.ReadAll(r)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -156,7 +325,6 @@ func TestEncoder_SmallDict(t *testing.T) {
 			var b []byte
 			var tmp []byte
 			for i := range encs {
-				i := i
 				t.Run(encNames[i], func(t *testing.T) {
 					b = encs[i].EncodeAll(decoded, b[:0])
 					tmp, err = dec.DecodeAll(in, tmp[:0])
@@ -183,7 +351,6 @@ func TestEncoder_SmallDict(t *testing.T) {
 			// Attempt to compress with all dicts
 			var tmp []byte
 			for i := range encs {
-				i := i
 				enc := encs[i]
 				t.Run(encNames[i], func(t *testing.T) {
 					var buf bytes.Buffer
@@ -221,18 +388,156 @@ func TestEncoder_SmallDict(t *testing.T) {
 	}
 }
 
+func TestEncoder_SmallDictFresh(t *testing.T) {
+	// All files have CRC
+	zr := testCreateZipReader("testdata/dict-tests-small.zip", t)
+	var dicts [][]byte
+	var encs []func() *Encoder
+	var noDictEncs []*Encoder
+	var encNames []string
+
+	for _, tt := range zr.File {
+		if !strings.HasSuffix(tt.Name, ".dict") {
+			continue
+		}
+		func() {
+			r, err := tt.Open()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			in, err := io.ReadAll(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dicts = append(dicts, in)
+			for level := SpeedFastest; level < speedLast; level++ {
+				if isRaceTest && level >= SpeedBestCompression {
+					break
+				}
+				level := level
+				encs = append(encs, func() *Encoder {
+					enc, err := NewWriter(nil, WithEncoderConcurrency(1), WithEncoderDict(in), WithEncoderLevel(level), WithWindowSize(1<<17))
+					if err != nil {
+						t.Fatal(err)
+					}
+					return enc
+				})
+				encNames = append(encNames, fmt.Sprint("level-", level.String(), "-dict-", len(dicts)))
+
+				enc, err := NewWriter(nil, WithEncoderConcurrency(1), WithEncoderLevel(level), WithWindowSize(1<<17))
+				if err != nil {
+					t.Fatal(err)
+				}
+				noDictEncs = append(noDictEncs, enc)
+			}
+		}()
+	}
+	dec, err := NewReader(nil, WithDecoderConcurrency(1), WithDecoderDicts(dicts...))
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	defer dec.Close()
+	for i, tt := range zr.File {
+		if testing.Short() && i > 100 {
+			break
+		}
+		if !strings.HasSuffix(tt.Name, ".zst") {
+			continue
+		}
+		r, err := tt.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Close()
+		in, err := io.ReadAll(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := dec.DecodeAll(in, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if testing.Short() && len(decoded) > 1000 {
+			continue
+		}
+
+		t.Run("encodeall-"+tt.Name, func(t *testing.T) {
+			// Attempt to compress with all dicts
+			var b []byte
+			var tmp []byte
+			for i := range encs {
+				t.Run(encNames[i], func(t *testing.T) {
+					enc := encs[i]()
+					defer enc.Close()
+					b = enc.EncodeAll(decoded, b[:0])
+					tmp, err = dec.DecodeAll(in, tmp[:0])
+					if err != nil {
+						t.Fatal(err)
+					}
+					if !bytes.Equal(tmp, decoded) {
+						t.Fatal("output mismatch")
+					}
+
+					tmp = noDictEncs[i].EncodeAll(decoded, tmp[:0])
+
+					if strings.Contains(t.Name(), "dictplain") && strings.Contains(t.Name(), "dict-1") {
+						t.Log("reference:", len(in), "no dict:", len(tmp), "with dict:", len(b), "SAVED:", len(tmp)-len(b))
+						// Check that we reduced this significantly
+						if len(b) > 250 {
+							t.Error("output was bigger than expected")
+						}
+					}
+				})
+			}
+		})
+		t.Run("stream-"+tt.Name, func(t *testing.T) {
+			// Attempt to compress with all dicts
+			var tmp []byte
+			for i := range encs {
+				t.Run(encNames[i], func(t *testing.T) {
+					enc := encs[i]()
+					defer enc.Close()
+					var buf bytes.Buffer
+					enc.ResetContentSize(&buf, int64(len(decoded)))
+					_, err := enc.Write(decoded)
+					if err != nil {
+						t.Fatal(err)
+					}
+					err = enc.Close()
+					if err != nil {
+						t.Fatal(err)
+					}
+					tmp, err = dec.DecodeAll(buf.Bytes(), tmp[:0])
+					if err != nil {
+						t.Fatal(err)
+					}
+					if !bytes.Equal(tmp, decoded) {
+						t.Fatal("output mismatch")
+					}
+					var buf2 bytes.Buffer
+					noDictEncs[i].Reset(&buf2)
+					noDictEncs[i].Write(decoded)
+					noDictEncs[i].Close()
+
+					if strings.Contains(t.Name(), "dictplain") && strings.Contains(t.Name(), "dict-1") {
+						t.Log("reference:", len(in), "no dict:", buf2.Len(), "with dict:", buf.Len(), "SAVED:", buf2.Len()-buf.Len())
+						// Check that we reduced this significantly
+						if buf.Len() > 250 {
+							t.Error("output was bigger than expected")
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
 func benchmarkEncodeAllLimitedBySize(b *testing.B, lowerLimit int, upperLimit int) {
-	fn := "testdata/dict-tests-small.zip"
-	data, err := ioutil.ReadFile(fn)
+	zr := testCreateZipReader("testdata/dict-tests-small.zip", b)
 	t := testing.TB(b)
 
-	if err != nil {
-		t.Fatal(err)
-	}
-	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
-	if err != nil {
-		t.Fatal(err)
-	}
 	var dicts [][]byte
 	var encs []*Encoder
 	var encNames []string
@@ -247,7 +552,7 @@ func benchmarkEncodeAllLimitedBySize(b *testing.B, lowerLimit int, upperLimit in
 				t.Fatal(err)
 			}
 			defer r.Close()
-			in, err := ioutil.ReadAll(r)
+			in, err := io.ReadAll(r)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -280,7 +585,7 @@ func benchmarkEncodeAllLimitedBySize(b *testing.B, lowerLimit int, upperLimit in
 			t.Fatal(err)
 		}
 		defer r.Close()
-		in, err := ioutil.ReadAll(r)
+		in, err := io.ReadAll(r)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -350,7 +655,7 @@ func TestDecoder_MoreDicts(t *testing.T) {
 	// All files have CRC
 	// https://files.klauspost.com/compress/zstd-dict-tests.zip
 	fn := "testdata/zstd-dict-tests.zip"
-	data, err := ioutil.ReadFile(fn)
+	data, err := os.ReadFile(fn)
 	if err != nil {
 		t.Skip("extended dict test not found.")
 	}
@@ -370,7 +675,7 @@ func TestDecoder_MoreDicts(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer r.Close()
-			in, err := ioutil.ReadAll(r)
+			in, err := io.ReadAll(r)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -396,7 +701,7 @@ func TestDecoder_MoreDicts(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer r.Close()
-			in, err := ioutil.ReadAll(r)
+			in, err := io.ReadAll(r)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -407,6 +712,538 @@ func TestDecoder_MoreDicts(t *testing.T) {
 			_, err = dec.DecodeAll(in, got[:0])
 			if err != nil {
 				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestDecoder_MoreDicts2(t *testing.T) {
+	// All files have CRC
+	// https://files.klauspost.com/compress/zstd-dict-tests.zip
+	fn := "testdata/zstd-dict-tests.zip"
+	data, err := os.ReadFile(fn)
+	if err != nil {
+		t.Skip("extended dict test not found.")
+	}
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var dicts [][]byte
+	for _, tt := range zr.File {
+		if !strings.HasSuffix(tt.Name, ".dict") {
+			continue
+		}
+		func() {
+			r, err := tt.Open()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			in, err := io.ReadAll(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dicts = append(dicts, in)
+		}()
+	}
+	dec, err := NewReader(nil, WithDecoderConcurrency(2), WithDecoderDicts(dicts...))
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	defer dec.Close()
+	for i, tt := range zr.File {
+		if !strings.HasSuffix(tt.Name, ".zst") {
+			continue
+		}
+		if testing.Short() && i > 50 {
+			continue
+		}
+		t.Run("decodeall-"+tt.Name, func(t *testing.T) {
+			r, err := tt.Open()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			in, err := io.ReadAll(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := dec.DecodeAll(in, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = dec.DecodeAll(in, got[:0])
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func readDicts(tb testing.TB, zr *zip.Reader) [][]byte {
+	var dicts [][]byte
+	for _, tt := range zr.File {
+		if !strings.HasSuffix(tt.Name, ".dict") {
+			continue
+		}
+		func() {
+			r, err := tt.Open()
+			if err != nil {
+				tb.Fatal(err)
+			}
+			defer r.Close()
+			in, err := io.ReadAll(r)
+			if err != nil {
+				tb.Fatal(err)
+			}
+			dicts = append(dicts, in)
+		}()
+	}
+	return dicts
+}
+
+// Test decoding of zstd --patch-from output.
+func TestDecoderRawDict(t *testing.T) {
+	t.Parallel()
+
+	dict, err := os.ReadFile("testdata/delta/source.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	delta, err := os.Open("testdata/delta/target.txt.zst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer delta.Close()
+
+	dec, err := NewReader(delta, WithDecoderDictRaw(0, dict))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := io.ReadAll(dec)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ref, err := os.ReadFile("testdata/delta/target.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(out, ref) {
+		t.Errorf("mismatch: got %q, wanted %q", out, ref)
+	}
+}
+
+// TestEncoderDictResetDifferentContent verifies that ResetWithOptions correctly
+// handles switching between raw dicts that share the same ID but have different
+// content lengths. Previously, the encoder cached dict tables by ID only, so a
+// shorter dict reusing the same ID would leave stale table entries pointing
+// beyond the new (shorter) history, causing an out-of-bounds panic in matchlen.
+func TestEncoderDictResetDifferentContent(t *testing.T) {
+	// Two raw dicts: same ID, different content lengths.
+	longDict := make([]byte, 700)
+	for i := range longDict {
+		longDict[i] = byte(i * 3)
+	}
+	shortDict := make([]byte, 120)
+	for i := range shortDict {
+		shortDict[i] = byte(i * 7)
+	}
+
+	const dictID = 42
+	// Payload reuses bytes from the tail of longDict (beyond shortDict's length).
+	// This makes stale dict table entries match during encoding, triggering the
+	// out-of-bounds access when the encoder uses the stale offset.
+	payload := make([]byte, 200)
+	copy(payload, longDict[500:])
+
+	for level := SpeedFastest; level < speedLast; level++ {
+		t.Run(level.String(), func(t *testing.T) {
+			enc, err := NewWriter(nil, WithEncoderConcurrency(1), WithEncoderLevel(level), WithEncoderDictRaw(dictID, longDict))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Encode with long dict first to populate table entries at high offsets.
+			enc.EncodeAll(payload, nil)
+
+			// Switch to shorter dict with same ID. This must rebuild the tables.
+			if err := enc.ResetWithOptions(nil, WithEncoderDictRaw(dictID, shortDict)); err != nil {
+				t.Fatal(err)
+			}
+			compressed := enc.EncodeAll(payload, nil)
+
+			// Verify round-trip with matching dict.
+			dec, err := NewReader(nil, WithDecoderConcurrency(1), WithDecoderDictRaw(dictID, shortDict))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer dec.Close()
+			got, err := dec.DecodeAll(compressed, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, payload) {
+				t.Errorf("round-trip mismatch: got %q, want %q", got, payload)
+			}
+		})
+	}
+}
+
+// TestEncoderDictAddViaReset verifies that adding/removing a dict via
+// ResetWithOptions works (requires recreating the encoder type).
+func TestEncoderDictAddViaReset(t *testing.T) {
+	dict := make([]byte, 120)
+	for i := range dict {
+		dict[i] = byte(i)
+	}
+	payload := []byte("hello world, this is a test payload!!")
+
+	for level := SpeedFastest; level < speedLast; level++ {
+		t.Run("nil-to-dict/"+level.String(), func(t *testing.T) {
+			enc, err := NewWriter(nil, WithEncoderConcurrency(1), WithEncoderLevel(level))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := enc.ResetWithOptions(nil, WithEncoderDictRaw(42, dict)); err != nil {
+				t.Fatal(err)
+			}
+			compressed := enc.EncodeAll(payload, nil)
+
+			dec, err := NewReader(nil, WithDecoderConcurrency(1), WithDecoderDictRaw(42, dict))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer dec.Close()
+			got, err := dec.DecodeAll(compressed, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, payload) {
+				t.Errorf("round-trip mismatch: got %q, want %q", got, payload)
+			}
+		})
+
+		t.Run("dict-to-nil/"+level.String(), func(t *testing.T) {
+			enc, err := NewWriter(nil, WithEncoderConcurrency(1), WithEncoderLevel(level), WithEncoderDictRaw(42, dict))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := enc.ResetWithOptions(nil, WithEncoderDictDelete()); err != nil {
+				t.Fatal(err)
+			}
+			compressed := enc.EncodeAll(payload, nil)
+
+			dec, err := NewReader(nil, WithDecoderConcurrency(1))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer dec.Close()
+			got, err := dec.DecodeAll(compressed, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, payload) {
+				t.Errorf("round-trip mismatch: got %q, want %q", got, payload)
+			}
+		})
+
+		t.Run("streaming-dict-to-nil/"+level.String(), func(t *testing.T) {
+			var buf bytes.Buffer
+			enc, err := NewWriter(&buf, WithEncoderConcurrency(2), WithEncoderLevel(level), WithEncoderDictRaw(42, dict))
+			if err != nil {
+				t.Fatal(err)
+			}
+			enc.Close()
+
+			buf.Reset()
+			if err := enc.ResetWithOptions(&buf, WithEncoderDictDelete()); err != nil {
+				t.Fatal(err)
+			}
+			_, err = enc.Write(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := enc.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			dec, err := NewReader(nil, WithDecoderConcurrency(1))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer dec.Close()
+			got, err := dec.DecodeAll(buf.Bytes(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, payload) {
+				t.Errorf("round-trip mismatch: got %q, want %q", got, payload)
+			}
+		})
+	}
+}
+
+// TestSharedDecoderTrainedDictRace verifies concurrent DecodeAll on one Decoder
+// that holds a trained dictionary does not race on dict.litEnc (gh-1180).
+func TestSharedDecoderTrainedDictRace(t *testing.T) {
+	weights := map[byte]int{'e': 40, 't': 20, 'a': 12, 'o': 8, 'i': 6, 'n': 5, 's': 4, 'h': 3, 'r': 2}
+	var alphabet []byte
+	for c, n := range weights {
+		for range n {
+			alphabet = append(alphabet, c)
+		}
+	}
+	sample := func(rng *rand.Rand, n int) []byte {
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = alphabet[rng.Intn(len(alphabet))]
+		}
+		return b
+	}
+
+	rng := rand.New(rand.NewSource(2000))
+	samples := make([][]byte, 2000)
+	for i := range samples {
+		samples[i] = sample(rng, 32+rng.Intn(200))
+	}
+	dict, err := BuildDict(BuildDictOptions{
+		ID:       12345,
+		Contents: samples,
+		History:  sample(rng, 12<<10),
+		Offsets:  [3]int{1, 4, 8},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	enc, err := NewWriter(nil, WithEncoderDict(dict), WithEncoderConcurrency(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	nFrames := 400
+	iters := 3000
+	goroutines := 48
+	if testing.Short() {
+		nFrames = 80
+		iters = 200
+		goroutines = 8
+	}
+	frames := make([][]byte, nFrames)
+	plains := make([][]byte, nFrames)
+	for i := 0; i < nFrames; i++ {
+		pt := sample(rng, 200+rng.Intn(800))
+		frames[i] = enc.EncodeAll(pt, nil)
+		plains[i] = pt
+	}
+	enc.Close()
+
+	dec, err := NewReader(nil, WithDecoderDicts(dict))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dec.Close()
+
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(seed int) {
+			defer wg.Done()
+			r := rand.New(rand.NewSource(int64(seed)))
+			for i := 0; i < iters; i++ {
+				idx := r.Intn(len(frames))
+				out, err := dec.DecodeAll(frames[idx], nil)
+				if err != nil {
+					t.Errorf("decode error: %v", err)
+					return
+				}
+				if !bytes.Equal(out, plains[idx]) {
+					t.Errorf("output mismatch")
+					return
+				}
+			}
+		}(g + 1)
+	}
+	wg.Wait()
+}
+
+// hideLen wraps a reader so the decoder cannot detect a *bytes.Reader and take
+// the small-buffer sync path; this forces the concurrent streaming decode path.
+type hideLen struct{ r io.Reader }
+
+func (h hideLen) Read(p []byte) (int, error) { return h.r.Read(p) }
+
+// TestDecoderDictReuseAfterLargeStream verifies that streaming-decoding a
+// dictionary-compressed frame whose output exceeds the window does not corrupt
+// the registered dictionary for later decodes on the same decoder.
+func TestDecoderDictReuseAfterLargeStream(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	dictContent := make([]byte, 8<<10)
+	rng.Read(dictContent)
+	const dictID = 12345
+	const windowSize = 256 << 10
+
+	// The payload starts with the dictionary content (so the encoder emits a
+	// match into the dictionary) and is long enough that decoded history
+	// exceeds the window while compressed blocks are still being executed.
+	payload := bytes.Repeat(dictContent, 2*windowSize/len(dictContent))
+
+	enc, err := NewWriter(nil, WithEncoderDictRaw(dictID, dictContent), WithWindowSize(windowSize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame := enc.EncodeAll(payload, nil)
+	enc.Close()
+
+	dec, err := NewReader(nil, WithDecoderDictRaw(dictID, dictContent))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dec.Close()
+
+	for i := range 3 {
+		if err := dec.Reset(hideLen{bytes.NewReader(frame)}); err != nil {
+			t.Fatalf("reset %d: %v", i, err)
+		}
+		got, err := io.ReadAll(dec)
+		if err != nil {
+			t.Fatalf("decode %d of a valid dictionary frame failed: %v", i, err)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("decode %d: output mismatch: got %d bytes, want %d", i, len(got), len(payload))
+		}
+	}
+}
+
+func TestEncoderDictSeedsSequenceTables(t *testing.T) {
+	initPredefined()
+	zr := testCreateZipReader("testdata/dict-tests-small.zip", t)
+	for _, tt := range zr.File {
+		if !strings.HasSuffix(tt.Name, ".dict") {
+			continue
+		}
+		r, err := tt.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		in, err := io.ReadAll(r)
+		r.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, err := loadDict(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var blk blockEnc
+		blk.init()
+		blk.initNewEncode()
+		blk.coders.seedPrevFromDict(d)
+		for _, tc := range []struct {
+			name string
+			enc  *fseEncoder
+			dec  *fseDecoder
+		}{
+			{"ll", blk.coders.llPrev, d.llDec.fse},
+			{"ml", blk.coders.mlPrev, d.mlDec.fse},
+			{"of", blk.coders.ofPrev, d.ofDec.fse},
+		} {
+			t.Run(tt.Name+"/"+tc.name, func(t *testing.T) {
+				if tc.enc.symbolLen != tc.dec.symbolLen || tc.enc.actualTableLog != tc.dec.actualTableLog {
+					t.Fatalf("got symbolLen %d tableLog %d, want %d %d", tc.enc.symbolLen, tc.enc.actualTableLog, tc.dec.symbolLen, tc.dec.actualTableLog)
+				}
+				if tc.enc.norm != tc.dec.norm {
+					t.Fatal("normalized counts differ from dictionary")
+				}
+				// A histogram shaped like the table must be encodable with it.
+				hist := make([]uint32, tc.enc.symbolLen)
+				for i, v := range tc.enc.norm[:tc.enc.symbolLen] {
+					if v != 0 {
+						hist[i] = 1
+					}
+				}
+				if tc.enc.approxSize(hist) == math.MaxUint32 {
+					t.Fatal("seeded table cannot be reused")
+				}
+			})
+		}
+	}
+}
+
+func TestEncoderChooseCompWithDictTables(t *testing.T) {
+	initPredefined()
+	zr := testCreateZipReader("testdata/dict-tests-small.zip", t)
+	var d *dict
+	for _, f := range zr.File {
+		if f.Name != "d0.dict" {
+			continue
+		}
+		r, err := f.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		in, err := io.ReadAll(r)
+		r.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, err = loadDict(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if d == nil {
+		t.Fatal("d0.dict not found")
+	}
+	for _, tc := range []struct {
+		name   string
+		table  tableIndex
+		counts map[uint8]uint32
+		want   seqCompMode
+	}{
+		// Final state flush makes the dictionary's larger table cost more.
+		{"ml-flush", tableMatchLengths, map[uint8]uint32{9: 1, 10: 1}, compModePredefined},
+		{"of-flush", tableOffsets, map[uint8]uint32{8: 1, 15: 1}, compModePredefined},
+		// A new table beats a poorly fitting dictionary table on its exact header size.
+		{"ll-new", tableLiteralLengths, map[uint8]uint32{3: 1, 4: 5}, compModeFSE},
+		{"of-new", tableOffsets, map[uint8]uint32{0: 5, 3: 1}, compModeFSE},
+		// A fitting dictionary table is reused.
+		{"ml-repeat", tableMatchLengths, map[uint8]uint32{3: 1, 6: 1}, compModeRepeat},
+		{"of-repeat", tableOffsets, map[uint8]uint32{10: 1, 11: 1}, compModeRepeat},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var blk blockEnc
+			blk.init()
+			blk.initNewEncode()
+			blk.coders.seedPrevFromDict(d)
+			prev := map[tableIndex]*fseEncoder{
+				tableLiteralLengths: blk.coders.llPrev,
+				tableOffsets:        blk.coders.ofPrev,
+				tableMatchLengths:   blk.coders.mlPrev,
+			}[tc.table]
+
+			cur := &fseEncoder{}
+			h := cur.Histogram()
+			var maxSym uint8
+			var maxCount, total int
+			for s, v := range tc.counts {
+				h[s] = v
+				maxSym = max(maxSym, s)
+				maxCount = max(maxCount, int(v))
+				total += int(v)
+			}
+			cur.HistogramFinished(maxSym, maxCount)
+			if err := cur.normalizeCount(total); err != nil {
+				t.Fatal(err)
+			}
+			if _, got := blk.chooseComp(cur, prev, &fsePredefEnc[tc.table]); got != tc.want {
+				t.Fatalf("got mode %d, want %d", got, tc.want)
 			}
 		})
 	}

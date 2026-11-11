@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"time"
 
 	"github.com/klauspost/compress/flate"
 )
@@ -74,6 +75,27 @@ func NewWriterLevel(w io.Writer, level int) (*Writer, error) {
 	return z, nil
 }
 
+// MinCustomWindowSize is the minimum window size that can be sent to NewWriterWindow.
+const MinCustomWindowSize = flate.MinCustomWindowSize
+
+// MaxCustomWindowSize is the maximum custom window that can be sent to NewWriterWindow.
+const MaxCustomWindowSize = flate.MaxCustomWindowSize
+
+// NewWriterWindow returns a new Writer compressing data with a custom window size.
+// windowSize must be from MinCustomWindowSize to MaxCustomWindowSize.
+func NewWriterWindow(w io.Writer, windowSize int) (*Writer, error) {
+	if windowSize < MinCustomWindowSize {
+		return nil, errors.New("gzip: requested window size less than MinWindowSize")
+	}
+	if windowSize > MaxCustomWindowSize {
+		return nil, errors.New("gzip: requested window size bigger than MaxCustomWindowSize")
+	}
+
+	z := new(Writer)
+	z.init(w, -windowSize)
+	return z, nil
+}
+
 func (z *Writer) init(w io.Writer, level int) {
 	compressor := z.compressor
 	if level != StatelessCompression {
@@ -106,12 +128,10 @@ func (z *Writer) writeBytes(b []byte) error {
 		return errors.New("gzip.Write: Extra data is too large")
 	}
 	le.PutUint16(z.buf[:2], uint16(len(b)))
-	_, err := z.w.Write(z.buf[:2])
-	if err != nil {
+	if err := z.write(z.buf[:2]); err != nil {
 		return err
 	}
-	_, err = z.w.Write(b)
-	return err
+	return z.write(b)
 }
 
 // writeString writes a UTF-8 string s in GZIP's format to z.w.
@@ -132,16 +152,28 @@ func (z *Writer) writeString(s string) (err error) {
 		for _, v := range s {
 			b = append(b, byte(v))
 		}
-		_, err = z.w.Write(b)
+		err = z.write(b)
 	} else {
-		_, err = io.WriteString(z.w, s)
+		var n int
+		n, err = io.WriteString(z.w, s)
+		if err == nil && n != len(s) {
+			err = io.ErrShortWrite
+		}
 	}
 	if err != nil {
 		return err
 	}
 	// GZIP strings are NUL-terminated.
 	z.buf[0] = 0
-	_, err = z.w.Write(z.buf[:1])
+	return z.write(z.buf[:1])
+}
+
+// write writes b to z.w and reports a short write as io.ErrShortWrite.
+func (z *Writer) write(b []byte) error {
+	n, err := z.w.Write(b)
+	if err == nil && n != len(b) {
+		err = io.ErrShortWrite
+	}
 	return err
 }
 
@@ -168,7 +200,11 @@ func (z *Writer) Write(p []byte) (int, error) {
 		if z.Comment != "" {
 			z.buf[3] |= 0x10
 		}
-		le.PutUint32(z.buf[4:8], uint32(z.ModTime.Unix()))
+		if z.ModTime.After(time.Unix(0, 0)) {
+			// Section 2.3.1, the zero value for MTIME means that the
+			// modified time is not set.
+			le.PutUint32(z.buf[4:8], uint32(z.ModTime.Unix()))
+		}
 		if z.level == BestCompression {
 			z.buf[8] = 2
 		} else if z.level == BestSpeed {
@@ -177,26 +213,26 @@ func (z *Writer) Write(p []byte) (int, error) {
 			z.buf[8] = 0
 		}
 		z.buf[9] = z.OS
-		n, z.err = z.w.Write(z.buf[:10])
+		z.err = z.write(z.buf[:10])
 		if z.err != nil {
-			return n, z.err
+			return 0, z.err
 		}
 		if z.Extra != nil {
 			z.err = z.writeBytes(z.Extra)
 			if z.err != nil {
-				return n, z.err
+				return 0, z.err
 			}
 		}
 		if z.Name != "" {
 			z.err = z.writeString(z.Name)
 			if z.err != nil {
-				return n, z.err
+				return 0, z.err
 			}
 		}
 		if z.Comment != "" {
 			z.err = z.writeString(z.Comment)
 			if z.err != nil {
-				return n, z.err
+				return 0, z.err
 			}
 		}
 

@@ -3,29 +3,20 @@ package zstd
 import (
 	"bytes"
 	"encoding/json"
-	"io/ioutil"
+	"io"
 	"os"
 	"strings"
 	"testing"
-
-	"github.com/klauspost/compress/zip"
 )
 
 func TestHeader_Decode(t *testing.T) {
-	data, err := ioutil.ReadFile("testdata/headers.zip")
-	if err != nil {
-		t.Fatal(err)
-	}
-	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
-	if err != nil {
-		t.Fatal(err)
-	}
+	zr := testCreateZipReader("testdata/headers.zip", t)
 
 	// Regenerate golden data...
 	const regen = false
 	golden := make(map[string]Header)
 	if !regen {
-		b, err := ioutil.ReadFile("testdata/headers-want.json.zst")
+		b, err := os.ReadFile("testdata/headers-want.json.zst")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -59,7 +50,7 @@ func TestHeader_Decode(t *testing.T) {
 				return
 			}
 			defer r.Close()
-			b, err := ioutil.ReadAll(r)
+			b, err := io.ReadAll(r)
 			if err != nil {
 				t.Error(err)
 				return
@@ -82,7 +73,7 @@ func TestHeader_Decode(t *testing.T) {
 				t.Errorf("want error, got result: %v", got)
 			}
 			if want != got {
-				t.Errorf("want %#v, got %#v", want, got)
+				t.Errorf("header mismatch:\nwant %#v\ngot  %#v", want, got)
 			}
 		})
 	}

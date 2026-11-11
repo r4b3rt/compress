@@ -1,6 +1,7 @@
 package zstd
 
 import (
+	"bytes"
 	"strconv"
 	"testing"
 )
@@ -150,5 +151,154 @@ func TestWindowSize(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestJobAndOverlapSize(t *testing.T) {
+	tests := []struct {
+		windowSize           int
+		level                EncoderLevel
+		jobSize, overlapSize int
+	}{
+		{MinWindowSize, SpeedDefault, 512 << 10, MinWindowSize / 8},
+		{64 << 20, SpeedBestCompression, 256 << 20, 32 << 20},
+		{128 << 20, SpeedBetterCompression, 256 << 20, 32 << 20},
+		{128 << 20, SpeedBestCompression, 256 << 20, 64 << 20},
+		// windowSize*4 overflows a 32-bit int here, so on 386 this row
+		// checks that jobSize clamps before multiplying.
+		{MaxWindowSize, SpeedBestCompression, 256 << 20, 128 << 20},
+	}
+	for _, tt := range tests {
+		o := encoderOptions{windowSize: tt.windowSize, level: tt.level}
+		if got := o.jobSize(); got != tt.jobSize {
+			t.Errorf("window %d, %v: jobSize = %d, want %d", tt.windowSize, tt.level, got, tt.jobSize)
+		}
+		if got := o.overlapSize(); got != tt.overlapSize {
+			t.Errorf("window %d, %v: overlapSize = %d, want %d", tt.windowSize, tt.level, got, tt.overlapSize)
+		}
+	}
+}
+
+func TestEncoderResetWithOptions(t *testing.T) {
+	var buf bytes.Buffer
+	enc, err := NewWriter(&buf, WithEncoderLevel(SpeedFastest), WithEncoderCRC(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer enc.Close()
+
+	// Test changing safe options
+	t.Run("change-crc", func(t *testing.T) {
+		err := enc.ResetWithOptions(&buf, WithEncoderCRC(false))
+		if err != nil {
+			t.Errorf("ResetWithOptions should allow changing CRC: %v", err)
+		}
+	})
+
+	t.Run("change-padding", func(t *testing.T) {
+		err := enc.ResetWithOptions(&buf, WithEncoderPadding(64))
+		if err != nil {
+			t.Errorf("ResetWithOptions should allow changing padding: %v", err)
+		}
+	})
+
+	// Test error when changing unsafe options
+	t.Run("change-level-error", func(t *testing.T) {
+		err := enc.ResetWithOptions(&buf, WithEncoderLevel(SpeedBestCompression))
+		if err == nil {
+			t.Error("ResetWithOptions should error when changing level")
+		}
+	})
+
+	t.Run("change-concurrency-error", func(t *testing.T) {
+		err := enc.ResetWithOptions(&buf, WithEncoderConcurrency(99))
+		if err == nil {
+			t.Error("ResetWithOptions should error when changing concurrency")
+		}
+	})
+
+	t.Run("change-window-error", func(t *testing.T) {
+		err := enc.ResetWithOptions(&buf, WithWindowSize(1<<15))
+		if err == nil {
+			t.Error("ResetWithOptions should error when changing window size")
+		}
+	})
+
+	t.Run("change-lowmem-error", func(t *testing.T) {
+		err := enc.ResetWithOptions(&buf, WithLowerEncoderMem(true))
+		if err == nil {
+			t.Error("ResetWithOptions should error when changing lowMem")
+		}
+	})
+
+	// Test same value is allowed
+	t.Run("same-level-ok", func(t *testing.T) {
+		err := enc.ResetWithOptions(&buf, WithEncoderLevel(SpeedFastest))
+		if err != nil {
+			t.Errorf("ResetWithOptions should allow same level: %v", err)
+		}
+	})
+}
+
+func TestEncoderDictDelete(t *testing.T) {
+	var buf bytes.Buffer
+	dictContent := []byte("test dictionary content for compression")
+	enc, err := NewWriter(&buf, WithEncoderDictRaw(123, dictContent))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer enc.Close()
+
+	if enc.o.dict == nil {
+		t.Fatal("dict should be set")
+	}
+
+	err = enc.ResetWithOptions(&buf, WithEncoderDictDelete())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if enc.o.dict != nil {
+		t.Error("dict should be nil after delete")
+	}
+}
+
+func TestEncoderResetWithOptionsErrorPreservesStream(t *testing.T) {
+	var buf, unused bytes.Buffer
+	enc, err := NewWriter(&buf, WithEncoderConcurrency(1), WithEncoderCRC(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer enc.Close()
+	first := bytes.Repeat([]byte("first log batch\n"), 1000)
+	second := bytes.Repeat([]byte("second log batch\n"), 1000)
+	if _, err := enc.Write(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.ResetWithOptions(&unused, WithEncoderCRC(false), WithEncoderConcurrency(2)); err == nil {
+		t.Fatal("expected changing concurrency to fail")
+	}
+	if _, err := enc.Write(second); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dec, err := NewReader(nil, WithDecoderConcurrency(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dec.Close()
+	got, err := dec.DecodeAll(buf.Bytes(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, append(first, second...)) {
+		t.Fatal("stream changed after a rejected reset")
+	}
+	if unused.Len() != 0 {
+		t.Fatal("rejected reset wrote to the new destination")
 	}
 }

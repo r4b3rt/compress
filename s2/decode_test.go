@@ -7,7 +7,9 @@ package s2
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"os"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -15,7 +17,7 @@ import (
 )
 
 func TestDecodeRegression(t *testing.T) {
-	data, err := ioutil.ReadFile("testdata/dec-block-regressions.zip")
+	data, err := os.ReadFile("testdata/dec-block-regressions.zip")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,7 +35,7 @@ func TestDecodeRegression(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			in, err := ioutil.ReadAll(r)
+			in, err := io.ReadAll(r)
 			if err != nil {
 				t.Error(err)
 			}
@@ -44,7 +46,7 @@ func TestDecodeRegression(t *testing.T) {
 }
 
 func TestDecoderMaxBlockSize(t *testing.T) {
-	data, err := ioutil.ReadFile("testdata/enc_regressions.zip")
+	data, err := os.ReadFile("testdata/enc_regressions.zip")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +85,7 @@ func TestDecoderMaxBlockSize(t *testing.T) {
 				}
 
 				dec.Reset(&buf)
-				got, err := ioutil.ReadAll(dec)
+				got, err := io.ReadAll(dec)
 				if err != nil {
 					t.Error(err)
 					return
@@ -122,19 +124,43 @@ func TestDecoderMaxBlockSize(t *testing.T) {
 					return
 				}
 				if enc.pad > 0 && buf.Len()%enc.pad != 0 {
-					t.Error(fmt.Errorf("wanted size to be mutiple of %d, got size %d with remainder %d", enc.pad, buf.Len(), buf.Len()%enc.pad))
+					t.Error(fmt.Errorf("wanted size to be multiple of %d, got size %d with remainder %d", enc.pad, buf.Len(), buf.Len()%enc.pad))
 					return
 				}
+				encoded := buf.Bytes()
 				dec.Reset(&buf)
 				// Skip first...
 				dec.Skip(int64(len(data)))
-				got, err = ioutil.ReadAll(dec)
+				got, err = io.ReadAll(dec)
 				if err != nil {
 					t.Error(err)
 					return
 				}
 				if !bytes.Equal(data, got) {
 					t.Error("frame (reset) decoder mismatch")
+					return
+				}
+				// Re-add data, Read concurrent.
+				buf.Write(encoded)
+				dec.Reset(&buf)
+				var doubleB bytes.Buffer
+				nb, err := dec.DecodeConcurrent(&doubleB, runtime.GOMAXPROCS(0))
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if nb != int64(len(data)*2) {
+					t.Errorf("want %d, got %d, err: %v", len(data)*2, nb, err)
+					return
+				}
+				got = doubleB.Bytes()[:len(data)]
+				if !bytes.Equal(data, got) {
+					t.Error("frame (DecodeConcurrent) decoder mismatch")
+					return
+				}
+				got = doubleB.Bytes()[len(data):]
+				if !bytes.Equal(data, got) {
+					t.Error("frame (DecodeConcurrent) decoder mismatch")
 					return
 				}
 			})
@@ -150,7 +176,7 @@ func TestDecoderMaxBlockSize(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			b, err := ioutil.ReadAll(r)
+			b, err := io.ReadAll(r)
 			if err != nil {
 				t.Error(err)
 				return

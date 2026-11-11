@@ -7,7 +7,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -31,10 +30,12 @@ var (
 	faster    = flag.Bool("faster", false, "Compress faster, but with a minor compression loss")
 	slower    = flag.Bool("slower", false, "Compress more, but a lot slower")
 	snappy    = flag.Bool("snappy", false, "Generate Snappy compatible output stream")
+	recomp    = flag.Bool("recomp", false, "Recompress Snappy or S2 input")
 	cpu       = flag.Int("cpu", runtime.GOMAXPROCS(0), "Compress using this amount of threads")
 	blockSize = flag.String("blocksize", "4M", "Max  block size. Examples: 64K, 256K, 1M, 4M. Must be power of two and <= 4MB")
 	block     = flag.Bool("block", false, "Compress as a single block. Will load content into memory.")
 	safe      = flag.Bool("safe", false, "Do not overwrite output files")
+	index     = flag.Bool("index", true, "Add seek index")
 	padding   = flag.String("pad", "1", "Pad size to a multiple of this value, Examples: 500, 64K, 256K, 1M, 4M, etc")
 	stdout    = flag.Bool("c", false, "Write all output to stdout. Multiple input files will be concatenated")
 	out       = flag.String("o", "", "Write output to another file. Single input file only")
@@ -48,6 +49,11 @@ var (
 
 	version = "(dev)"
 	date    = "(unknown)"
+)
+
+const (
+	s2Ext     = ".s2"
+	snappyExt = ".sz" // https://github.com/google/snappy/blob/main/framing_format.txt#L34
 )
 
 func main() {
@@ -70,7 +76,7 @@ func main() {
 		_, _ = fmt.Fprintln(os.Stderr, `Usage: s2c [options] file1 file2
 
 Compresses all files supplied as input separately.
-Output files are written as 'filename.ext.s2' or 'filename.ext.snappy'.
+Output files are written as 'filename.ext`+s2Ext+`' or 'filename.ext`+snappyExt+`'.
 By default output files will be overwritten.
 Use - as the only file name to read from stdin and write to stdout.
 
@@ -84,7 +90,10 @@ Options:`)
 		flag.PrintDefaults()
 		os.Exit(0)
 	}
-	opts := []s2.WriterOption{s2.WriterBlockSize(int(sz)), s2.WriterConcurrency(*cpu), s2.WriterPadding(int(pad))}
+	opts := []s2.WriterOption{s2.WriterBlockSize(sz), s2.WriterConcurrency(*cpu), s2.WriterPadding(pad)}
+	if *index {
+		opts = append(opts, s2.WriterAddIndex())
+	}
 	if !*faster {
 		opts = append(opts, s2.WriterBetterCompression())
 	}
@@ -113,7 +122,7 @@ Options:`)
 			dstFile, err := os.OpenFile(*out, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.ModePerm)
 			exitErr(err)
 			defer dstFile.Close()
-			bw := bufio.NewWriterSize(dstFile, int(sz)*2)
+			bw := bufio.NewWriterSize(dstFile, sz*2)
 			defer bw.Flush()
 			wr.Reset(bw)
 		}
@@ -238,7 +247,7 @@ Options:`)
 								fmt.Printf(" %d -> %d [%.02f%%]; %v, %.01fMB/s", len(compressed), len(decomp), pct, ms, mbpersec)
 							}
 							if !bytes.Equal(decomp, b) {
-								exitErr(fmt.Errorf("decompresed data mismatch"))
+								exitErr(fmt.Errorf("decompressed data mismatch"))
 							}
 							if !*quiet {
 								fmt.Print("... Verified ok.")
@@ -264,7 +273,7 @@ Options:`)
 				file.Close()
 				var buf *bytes.Buffer
 				for i := 0; i < *bench; i++ {
-					w := ioutil.Discard
+					w := io.Discard
 					// Verify with this buffer...
 					if *verify {
 						if buf == nil {
@@ -297,7 +306,7 @@ Options:`)
 						}
 						start := time.Now()
 						dec.Reset(buf)
-						n, err := io.Copy(ioutil.Discard, dec)
+						n, err := dec.DecodeConcurrent(io.Discard, *cpu)
 						exitErr(err)
 						if int(n) != len(b) {
 							exitErr(fmt.Errorf("unexpected size, want %d, got %d", len(b), n))
@@ -321,9 +330,9 @@ Options:`)
 		}
 		os.Exit(0)
 	}
-	ext := ".s2"
+	ext := s2Ext
 	if *snappy {
-		ext = ".snappy"
+		ext = snappyExt
 	}
 	if *block {
 		ext += ".block"
@@ -333,6 +342,9 @@ Options:`)
 	}
 	for _, filename := range files {
 		if *block {
+			if *recomp {
+				exitErr(errors.New("cannot recompress blocks (yet)"))
+			}
 			func() {
 				var closeOnce sync.Once
 				dstFilename := cleanFileName(fmt.Sprintf("%s%s", filename, ext))
@@ -346,7 +358,7 @@ Options:`)
 				file, _, mode := openFile(filename)
 				exitErr(err)
 				defer closeOnce.Do(func() { file.Close() })
-				inBytes, err := ioutil.ReadAll(file)
+				inBytes, err := io.ReadAll(file)
 				exitErr(err)
 
 				var out io.Writer
@@ -420,13 +432,36 @@ Options:`)
 		}
 		func() {
 			var closeOnce sync.Once
-			dstFilename := cleanFileName(fmt.Sprintf("%s%s", filename, ext))
+			outFileBase := filename
+			if *recomp {
+				switch {
+				case strings.HasSuffix(outFileBase, s2Ext):
+					outFileBase = strings.TrimSuffix(outFileBase, s2Ext)
+				case strings.HasSuffix(outFileBase, snappyExt):
+					outFileBase = strings.TrimSuffix(outFileBase, snappyExt)
+				case strings.HasSuffix(outFileBase, ".snappy"):
+					outFileBase = strings.TrimSuffix(outFileBase, ".snappy")
+				}
+			}
+			dstFilename := cleanFileName(fmt.Sprintf("%s%s", outFileBase, ext))
 			if *out != "" {
 				dstFilename = *out
 			}
 			if !*quiet {
 				fmt.Print("Compressing ", filename, " -> ", dstFilename)
 			}
+
+			if dstFilename == filename && !*stdout {
+				if *remove {
+					exitErr(errors.New("cannot remove when input = output"))
+				}
+				renameDst := dstFilename
+				dstFilename = fmt.Sprintf(".tmp-%s%s", time.Now().Format("2006-01-02T15-04-05Z07"), ext)
+				defer func() {
+					exitErr(os.Rename(dstFilename, renameDst))
+				}()
+			}
+
 			// Input file.
 			file, _, mode := openFile(filename)
 			exitErr(err)
@@ -434,6 +469,23 @@ Options:`)
 			src, err := readahead.NewReaderSize(file, *cpu+1, 1<<20)
 			exitErr(err)
 			defer src.Close()
+			var rc = &rCounter{
+				in: src,
+			}
+			if !*quiet {
+				// We only need to count for printing
+				src = rc
+			}
+			if *recomp {
+				dec := s2.NewReader(src)
+				pr, pw := io.Pipe()
+				go func() {
+					_, err := dec.DecodeConcurrent(pw, *cpu)
+					pw.CloseWithError(err)
+				}()
+				src = pr
+			}
+
 			var out io.Writer
 			switch {
 			case *stdout:
@@ -457,11 +509,12 @@ Options:`)
 			wr.Reset(&wc)
 			defer wr.Close()
 			start := time.Now()
-			input, err := wr.ReadFrom(src)
+			_, err = wr.ReadFrom(src)
 			exitErr(err)
 			err = wr.Close()
 			exitErr(err)
 			if !*quiet {
+				input := rc.n
 				elapsed := time.Since(start)
 				mbpersec := (float64(input) / (1024 * 1024)) / (float64(elapsed) / (float64(time.Second)))
 				pct := float64(wc.n) * 100 / float64(input)
@@ -530,13 +583,11 @@ func verifyTo(w io.Writer) (io.Writer, func() error) {
 	writer := io.MultiWriter(w, pw)
 	var wg sync.WaitGroup
 	var err error
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		r := s2.NewReader(pr)
-		_, err = io.Copy(ioutil.Discard, r)
+		_, err = r.DecodeConcurrent(io.Discard, *cpu)
 		pr.CloseWithError(fmt.Errorf("verify: %w", err))
-	}()
+	})
 	return writer, func() error {
 		pw.Close()
 		wg.Wait()
@@ -563,7 +614,7 @@ func exitErr(err error) {
 }
 
 // toSize converts a size indication to bytes.
-func toSize(size string) (uint64, error) {
+func toSize(size string) (int, error) {
 	size = strings.ToUpper(strings.TrimSpace(size))
 	firstLetter := strings.IndexFunc(size, unicode.IsLetter)
 	if firstLetter == -1 {
@@ -571,18 +622,18 @@ func toSize(size string) (uint64, error) {
 	}
 
 	bytesString, multiple := size[:firstLetter], size[firstLetter:]
-	bytes, err := strconv.ParseUint(bytesString, 10, 64)
+	sz, err := strconv.Atoi(bytesString)
 	if err != nil {
 		return 0, fmt.Errorf("unable to parse size: %v", err)
 	}
 
 	switch multiple {
 	case "M", "MB", "MIB":
-		return bytes * 1 << 20, nil
+		return sz * 1 << 20, nil
 	case "K", "KB", "KIB":
-		return bytes * 1 << 10, nil
+		return sz * 1 << 10, nil
 	case "B", "":
-		return bytes, nil
+		return sz, nil
 	default:
 		return 0, fmt.Errorf("unknown size suffix: %v", multiple)
 	}
@@ -598,4 +649,19 @@ func (w *wCounter) Write(p []byte) (n int, err error) {
 	w.n += n
 	return n, err
 
+}
+
+type rCounter struct {
+	n  int64
+	in io.Reader
+}
+
+func (w *rCounter) Read(p []byte) (n int, err error) {
+	n, err = w.in.Read(p)
+	w.n += int64(n)
+	return n, err
+}
+
+func (w *rCounter) Close() (err error) {
+	return nil
 }
